@@ -54,10 +54,34 @@ run_static_checks() {
         tests/test_bsp_audio_recovery.c components/bsp/src/bsp_es8311_sleep_check.c \
         -o "${test_dir}/test_bsp_audio_recovery"
     "${test_dir}/test_bsp_audio_recovery"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_store.c main/jianlu_store.c \
+        -o "${test_dir}/test_jianlu_store"
+    "${test_dir}/test_jianlu_store"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_voice.c main/jianlu_voice.c \
+        -o "${test_dir}/test_jianlu_voice"
+    "${test_dir}/test_jianlu_voice"
+    # JSON 解析测试直接编 ESP-IDF 源码树里的 cJSON;未激活 IDF 时跳过。
+    if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/components/json/cJSON/cJSON.c" ]]; then
+        "${CC:-cc}" -std=c11 -Wall -Wextra \
+            -Imain -I"${IDF_PATH}/components/json/cJSON" \
+            tests/test_jianlu_json.c main/jianlu_json.c main/jianlu_store.c \
+            "${IDF_PATH}/components/json/cJSON/cJSON.c" \
+            -o "${test_dir}/test_jianlu_json"
+        "${test_dir}/test_jianlu_json"
+    else
+        echo "test_jianlu_json: SKIP (IDF cJSON source not found)"
+    fi
+    # Linux ld 用 --gc-sections;macOS ld 对应 -dead_strip。
+    local gc_flag="--gc-sections"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        gc_flag="-dead_strip"
+    fi
     for demo in audio low_power ble wifi; do
         "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
             -ffunction-sections -fdata-sections -Itests/demo_stubs -Imain \
-            "tests/test_demo_${demo}_runtime.c" -Wl,--gc-sections \
+            "tests/test_demo_${demo}_runtime.c" -Wl,${gc_flag} \
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done

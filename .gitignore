@@ -11,3 +11,6 @@ managed_components/
 /.agents/skills/passport-build
 /.agents/skills/passport-device-test
 /.agents/skills/passport-debug
+
+# 本地凭据(Wi-Fi/中枢),严禁提交
+sdkconfig.defaults.user

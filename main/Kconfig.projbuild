@@ -1,0 +1,23 @@
+menu "Xiaonuo Jianlu (小诺简录)"
+
+    config XIAONUO_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            设备要连接的 2.4GHz Wi-Fi 名称。留空则进入"网络未配置"态。
+            也可在 sdkconfig.defaults.user(已 gitignore)里填,避免提交凭据。
+
+    config XIAONUO_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Wi-Fi 密码(WPA2)。切勿提交到仓库。
+
+    config XIAONUO_HUB_URL
+        string "Hub base URL"
+        default ""
+        help
+            中枢服务地址,例如 http://192.168.1.10:3000(不带尾部斜杠)。
+            设备与中枢需在同一局域网;留空则进入"网络未配置"态。
+
+endmenu
