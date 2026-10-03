@@ -4,9 +4,19 @@
 #include <stddef.h>
 
 #include "esp_err.h"
+#include "jianlu_nvs.h"
 #include "jianlu_store.h"
 
-// GET {CONFIG_XIAONUO_HUB_URL}/api/records?status=pending&pageSize=20
+// 设置/读取运行时中枢地址(mDNS 发现、NVS 缓存或 Kconfig 开发覆盖)。
+// 未设置(空串)时 fetch/complete 直接返回 ESP_ERR_INVALID_STATE。
+void jianlu_hub_set_base(const char *url);
+const char *jianlu_hub_base(void);
+
+// 网络任务共享刮擦缓冲(9KB):fetch 响应体、capture 响应、上传分块、
+// mDNS 包都复用它——网络任务内串行使用,省数份静态缓冲。
+uint8_t *jianlu_net_scratch(size_t *len);
+
+// GET {hub}/api/records?status=pending&pageSize=20
 // 成功时把 records 填入 store 并返回 ESP_OK;失败返回错误并把可读说明写进
 // errbuf(可为 NULL)。无 PSRAM:响应收进定长静态缓冲,超长直接报错,
 // 服务器侧 pageSize=20 的正常响应远在缓冲之内。

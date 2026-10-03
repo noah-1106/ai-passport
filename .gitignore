@@ -14,3 +14,4 @@ managed_components/
 
 # 本地凭据(Wi-Fi/中枢),严禁提交
 sdkconfig.defaults.user
+build_factory/

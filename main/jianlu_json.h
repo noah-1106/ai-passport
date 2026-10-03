@@ -19,6 +19,9 @@ typedef struct {
     char transcript[JIANLU_TRANSCRIPT_LEN];
     char reply[JIANLU_REPLY_LEN];
     int new_count;   // records 数组条数(无该字段为 0)
+    // records[0] 的概要(确认页展示用;new_count==0 时为空)
+    char new_title[JIANLU_TITLE_LEN];
+    jianlu_type_t new_type;
 } jianlu_capture_result_t;
 
 // 解析 {"transcript":...,"reply":...,"records":[...]}。字段缺失按空串/0 处理。

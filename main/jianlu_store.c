@@ -50,6 +50,8 @@ bool jianlu_store_add(jianlu_store_t *store, const char *id, const char *title,
     jianlu_utf8_copy(rec->summary, sizeof(rec->summary), summary, sizeof(rec->summary) - 1);
     rec->type = type;
     rec->completing = false;
+    rec->sync_pending = false;
+    rec->voice_placeholder = false;
     // 日期只取 "YYYY-MM-DD" 前 10 字节(纯 ASCII,不涉及 UTF-8 边界)
     jianlu_utf8_copy(rec->date, sizeof(rec->date), date, 10);
     rec->tag_count = 0;
@@ -98,6 +100,62 @@ bool jianlu_store_set_completing(jianlu_store_t *store, const char *id, bool com
             store->records[i].completing = completing;
             return true;
         }
+    }
+    return false;
+}
+
+bool jianlu_store_set_sync_pending(jianlu_store_t *store, const char *id, bool pending)
+{
+    if (id == NULL) return false;
+    for (int i = 0; i < store->count; i++) {
+        if (strcmp(store->records[i].id, id) == 0) {
+            store->records[i].sync_pending = pending;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool jianlu_store_is_voice_placeholder(const jianlu_record_t *rec)
+{
+    return rec != NULL && rec->voice_placeholder;
+}
+
+bool jianlu_store_ensure_voice_placeholder(jianlu_store_t *store)
+{
+    for (int i = 0; i < store->count; i++) {
+        if (store->records[i].voice_placeholder) return true;   // 已存在
+    }
+    if (store->count >= JIANLU_MAX_RECORDS) return false;
+    memmove(&store->records[1], &store->records[0],
+            (size_t)store->count * sizeof(store->records[0]));
+    store->count++;
+    store->selected++;   // 选中跟随原有卡片下移
+    jianlu_record_t *rec = &store->records[0];
+    memset(rec, 0, sizeof(*rec));
+    jianlu_utf8_copy(rec->id, sizeof(rec->id), JIANLU_VOICE_PLACEHOLDER_ID,
+                     sizeof(rec->id) - 1);
+    jianlu_utf8_copy(rec->title, sizeof(rec->title), "语音 · 未识别",
+                     sizeof(rec->title) - 1);
+    jianlu_utf8_copy(rec->summary, sizeof(rec->summary), "待同步",
+                     sizeof(rec->summary) - 1);
+    rec->type = JIANLU_TYPE_OTHER;
+    rec->voice_placeholder = true;
+    return true;
+}
+
+bool jianlu_store_remove_voice_placeholder(jianlu_store_t *store)
+{
+    for (int i = 0; i < store->count; i++) {
+        if (!store->records[i].voice_placeholder) continue;
+        memmove(&store->records[i], &store->records[i + 1],
+                (size_t)(store->count - i - 1) * sizeof(store->records[0]));
+        store->count--;
+        if (store->selected > i) store->selected--;
+        if (store->selected >= store->count) {
+            store->selected = store->count > 0 ? store->count - 1 : 0;
+        }
+        return true;
     }
     return false;
 }

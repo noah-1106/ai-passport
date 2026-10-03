@@ -12,7 +12,7 @@
 ## jianlu_font_16.c (build artifact, tracked in version control)
 
 16px LVGL application font covering the full GB2312 Hanzi set plus ASCII and
-full-width punctuation (`jianlu_charset.txt`, 7046 characters). Used to render
+full-width punctuation (`jianlu_charset.txt`, 7048 characters). Used to render
 arbitrary Chinese content produced by speech recognition (the built-in
 `lv_font_source_han_sans_sc_16_cjk` covers only 1187 characters and is not
 sufficient).

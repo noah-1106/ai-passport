@@ -15,6 +15,10 @@
 // 线程约定:所有函数必须在 LVGL 任务内、或持有 bsp_lvgl_lock() 时调用。
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "jianlu_json.h"
 #include "jianlu_store.h"
 
 typedef enum {
@@ -22,6 +26,7 @@ typedef enum {
     JIANLU_ANIM_NEXT,       // 顶卡向下一张切换(向上飞出)
     JIANLU_ANIM_PREV,       // 向上一张(顶卡直接换,飞出方向不区分)
     JIANLU_ANIM_COMPLETE,   // 完成:顶卡向右划出
+    JIANLU_ANIM_ARRIVE,     // 新简录:顶卡从上方滑入+淡入
 } jianlu_anim_t;
 
 // 建屏并加载。LVGL 已初始化后调用一次。
@@ -35,5 +40,35 @@ void jianlu_ui_refresh(const jianlu_store_t *store, jianlu_anim_t anim);
 void jianlu_ui_voice_idle(void);
 void jianlu_ui_voice_recording(int elapsed_sec);
 void jianlu_ui_voice_sending(void);
-void jianlu_ui_voice_confirm(const char *transcript, const char *reply, int new_count);
+// 确认页呈现:new_count>0 以新卡(徽标+标题)为主,否则以 reply 为主;
+// 完整内容(transcript+reply)一页放不下时进入分页查看模式。
+// 返回 true = 分页模式,调用方应禁用自动返回计时(用户翻页读完,OK 返回)。
+bool jianlu_ui_confirm_present(const jianlu_capture_result_t *res);
 void jianlu_ui_voice_error(void);
+
+// ---- 分页文本查看器(通用组件;后续"简录详情页"复用)----
+// open 时 text 会被清洗并拷入内部缓冲(调用方无需保活)。
+// UP/DOWN 翻页(边界不循环),页码指示 "当前/总页";OK 的语义由调用方定
+// (通常 jianlu_ui_pager_close 后执行返回逻辑)。
+void jianlu_ui_pager_open(const char *title, const char *text);
+bool jianlu_ui_pager_is_open(void);
+void jianlu_ui_pager_close(void);
+void jianlu_ui_pager_next(void);
+void jianlu_ui_pager_prev(void);
+
+// 录音电平输入(0..100),驱动声波动画。只写 volatile,
+// 可在任意任务上下文调用(录音任务每块调一次)。
+void jianlu_ui_voice_set_level(uint8_t level);
+
+// 勾选成功的对勾浮层(lv_line 画,不占字形),800ms 自动消失,不拦截按键。
+// 须在 LVGL 上下文调用。
+void jianlu_ui_success_flash(void);
+
+// ---- 配网引导信息(PROVISIONING 视图的状态文案;每次进入/变化时调用)----
+// dev_name 传 NULL 表示尚未生成;phone_connected 表示手机已连上 BLE。
+void jianlu_ui_provision_info(const char *dev_name, bool phone_connected);
+
+// ---- 通用覆盖层(重配确认等二次确认场景;与语音层共用一块面板)----
+void jianlu_ui_overlay(const char *title, uint32_t color_hex,
+                       const char *body, const char *hint);
+void jianlu_ui_overlay_hide(void);

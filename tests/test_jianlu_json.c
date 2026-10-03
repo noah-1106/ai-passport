@@ -105,6 +105,9 @@ static void test_parse_capture_response(void) {
     assert(strcmp(out.transcript, "记一下今天下午三点开会") == 0);
     assert(strcmp(out.reply, "好的,已记下今天下午三点开会") == 0);
     assert(out.new_count == 1);
+    // records[0] 概要(确认页展示)
+    assert(strcmp(out.new_title, "下午三点开会") == 0);
+    assert(out.new_type == JIANLU_TYPE_TODO);
 
     // 字段缺失容忍
     static const char partial[] = "{\"transcript\":\"嗯\"}";

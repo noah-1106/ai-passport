@@ -101,7 +101,16 @@ int jianlu_json_parse_capture(const char *body, size_t len, jianlu_capture_resul
     jianlu_utf8_copy(out->reply, sizeof(out->reply),
                      json_string(root, "reply"), sizeof(out->reply) - 1);
     const cJSON *records = cJSON_GetObjectItemCaseSensitive(root, "records");
-    if (cJSON_IsArray(records)) out->new_count = cJSON_GetArraySize(records);
+    if (cJSON_IsArray(records)) {
+        out->new_count = cJSON_GetArraySize(records);
+        const cJSON *first = cJSON_GetArrayItem(records, 0);
+        if (cJSON_IsObject(first)) {
+            jianlu_utf8_copy(out->new_title, sizeof(out->new_title),
+                             json_string(first, "title"),
+                             sizeof(out->new_title) - 1);
+            out->new_type = jianlu_type_from_string(json_string(first, "type"));
+        }
+    }
 
     cJSON_Delete(root);
     return 0;

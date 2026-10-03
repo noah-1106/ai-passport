@@ -62,6 +62,42 @@ run_static_checks() {
         tests/test_jianlu_voice.c main/jianlu_voice.c \
         -o "${test_dir}/test_jianlu_voice"
     "${test_dir}/test_jianlu_voice"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_config.c main/jianlu_config.c \
+        -o "${test_dir}/test_jianlu_config"
+    "${test_dir}/test_jianlu_config"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_netflow.c main/jianlu_netflow.c main/jianlu_store.c \
+        -o "${test_dir}/test_jianlu_netflow"
+    "${test_dir}/test_jianlu_netflow"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_dns.c main/jianlu_dns.c \
+        -o "${test_dir}/test_jianlu_dns"
+    "${test_dir}/test_jianlu_dns"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_level.c main/jianlu_level.c \
+        -o "${test_dir}/test_jianlu_level"
+    "${test_dir}/test_jianlu_level"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_snapshot.c main/jianlu_snapshot.c main/jianlu_store.c \
+        -o "${test_dir}/test_jianlu_snapshot"
+    "${test_dir}/test_jianlu_snapshot"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_powersave.c main/jianlu_powersave.c \
+        -o "${test_dir}/test_jianlu_powersave"
+    "${test_dir}/test_jianlu_powersave"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_glyph.c main/jianlu_glyph.c \
+        -o "${test_dir}/test_jianlu_glyph"
+    "${test_dir}/test_jianlu_glyph"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_layout.c main/jianlu_layout.c \
+        -o "${test_dir}/test_jianlu_layout"
+    "${test_dir}/test_jianlu_layout"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_pager.c main/jianlu_pager.c \
+        -o "${test_dir}/test_jianlu_pager"
+    "${test_dir}/test_jianlu_pager"
     # JSON 解析测试直接编 ESP-IDF 源码树里的 cJSON;未激活 IDF 时跳过。
     if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/components/json/cJSON/cJSON.c" ]]; then
         "${CC:-cc}" -std=c11 -Wall -Wextra \

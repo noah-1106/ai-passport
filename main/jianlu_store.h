@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define JIANLU_MAX_RECORDS  20
+#define JIANLU_MAX_RECORDS  12
 #define JIANLU_ID_LEN       32
 #define JIANLU_TITLE_LEN    96    // 字节,约 31 个汉字
 #define JIANLU_SUMMARY_LEN  128   // 字节,约 42 个汉字
@@ -28,18 +28,25 @@ typedef struct {
     char title[JIANLU_TITLE_LEN];
     char summary[JIANLU_SUMMARY_LEN];
     jianlu_type_t type;
-    bool completing;   // 已发出完成请求、等待中枢确认
+    bool completing;    // 已发出完成请求、等待中枢确认
+    bool sync_pending;  // 离线勾选,待联网同步
+    bool voice_placeholder; // 语音占位卡(未识别的 pending 录音,非中枢数据)
     char date[JIANLU_DATE_LEN];                 // createdAt 的日期部分,可为空串
     char tags[JIANLU_MAX_TAGS][JIANLU_TAG_LEN]; // 前 tag_count 个有效
     int tag_count;
 } jianlu_record_t;
 
+// 语音占位卡 id:以 0x01 开头,不可能与中枢的数字/字符串 id 冲突。
+#define JIANLU_VOICE_PLACEHOLDER_ID "\x01VOICE_PENDING"
+
 // 视图状态机:UI 与网络事件都收敛到这里,刷新时只读它。
 typedef enum {
     JIANLU_VIEW_BOOT = 0,     // 启动中
-    JIANLU_VIEW_NO_CONFIG,    // 未配置 Wi-Fi 凭据或中枢地址
+    JIANLU_VIEW_NO_CONFIG,    // 未配置 Wi-Fi 凭据或中枢地址(保留给 Kconfig 缺省提示)
+    JIANLU_VIEW_PROVISIONING, // 配网态:BLUFI 广播,等待手机下发凭据
     JIANLU_VIEW_CONNECTING,   // 正在连接 Wi-Fi
-    JIANLU_VIEW_LOADING,      // Wi-Fi 已通,正在拉取清单
+    JIANLU_VIEW_DISCOVERING,  // Wi-Fi 已通,mDNS 寻找中枢
+    JIANLU_VIEW_LOADING,      // 中枢已确定,正在拉取清单
     JIANLU_VIEW_READY,        // 清单可用(可能为空)
     JIANLU_VIEW_ERROR,        // 出错,error 里有说明
 } jianlu_view_t;
@@ -49,6 +56,7 @@ typedef struct {
     int count;
     int selected;             // 0..count-1;count==0 时无意义
     jianlu_view_t view;
+    bool offline;             // 离线模式:清单来自本地快照,操作只记待同步
     char error[JIANLU_ERROR_LEN];
 } jianlu_store_t;
 
@@ -72,6 +80,15 @@ const jianlu_record_t *jianlu_store_selected(const jianlu_store_t *store);
 
 // 按 id 标记/清除"完成中";返回是否找到。
 bool jianlu_store_set_completing(jianlu_store_t *store, const char *id, bool completing);
+
+// 按 id 标记/清除"离线待同步";返回是否找到。
+bool jianlu_store_set_sync_pending(jianlu_store_t *store, const char *id, bool pending);
+
+// ---- 语音占位卡(pending.wav 的清单内呈现)----
+// 插到 0 号位(已存在则不动,返回 true);清单满返回 false。
+bool jianlu_store_ensure_voice_placeholder(jianlu_store_t *store);
+bool jianlu_store_remove_voice_placeholder(jianlu_store_t *store);
+bool jianlu_store_is_voice_placeholder(const jianlu_record_t *rec);
 
 // 按 id 删除并收敛选中项;返回是否找到。
 bool jianlu_store_remove(jianlu_store_t *store, const char *id);

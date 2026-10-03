@@ -128,6 +128,40 @@ static void test_view_error(void) {
     assert(store.error[0] == '\0');
 }
 
+static void test_voice_placeholder(void) {
+    jianlu_store_t store;
+    jianlu_store_init(&store);
+    jianlu_store_replace_begin(&store);
+    jianlu_store_add(&store, "a", "t1", "s", JIANLU_TYPE_TODO, NULL, NULL, NULL);
+    jianlu_store_add(&store, "b", "t2", "s", JIANLU_TYPE_TODO, NULL, NULL, NULL);
+    jianlu_store_replace_end(&store);
+    store.selected = 1;
+
+    // 插入占位卡到 0 号位,选中跟随下移
+    assert(jianlu_store_ensure_voice_placeholder(&store));
+    assert(store.count == 3);
+    assert(store.selected == 2);
+    assert(jianlu_store_is_voice_placeholder(&store.records[0]));
+    assert(strcmp(store.records[0].id, JIANLU_VOICE_PLACEHOLDER_ID) == 0);
+    assert(strcmp(store.records[0].title, "语音 · 未识别") == 0);
+    assert(strcmp(jianlu_store_selected(&store)->id, "b") == 0);
+
+    // 幂等:重复插入不翻倍
+    assert(jianlu_store_ensure_voice_placeholder(&store));
+    assert(store.count == 3);
+
+    // 普通记录不被误判
+    assert(!jianlu_store_is_voice_placeholder(&store.records[1]));
+    assert(!jianlu_store_is_voice_placeholder(NULL));
+
+    // 移除占位卡,选中跟随回移
+    assert(jianlu_store_remove_voice_placeholder(&store));
+    assert(store.count == 2);
+    assert(store.selected == 1);
+    assert(strcmp(jianlu_store_selected(&store)->id, "b") == 0);
+    assert(!jianlu_store_remove_voice_placeholder(&store));
+}
+
 int main(void) {
     test_utf8_copy();
     test_add_move_wrap();
@@ -135,5 +169,6 @@ int main(void) {
     test_remove_clamps_selection();
     test_completing_and_types();
     test_view_error();
+    test_voice_placeholder();
     return 0;
 }

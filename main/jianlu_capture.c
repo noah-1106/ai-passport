@@ -5,9 +5,11 @@
 #include <string.h>
 
 #include "bsp_audio.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "jianlu_hub.h"
 #include "jianlu_voice.h"
 
 static const char *TAG = "jianlu_cap";
@@ -15,11 +17,14 @@ static const char *TAG = "jianlu_cap";
 #define REC_PATH     "/voicefs/rec.wav"
 #define PENDING_PATH "/voicefs/pending.wav"
 #define HTTP_CHUNK   2048          // 上传分块
-#define RESP_SIZE    (8 * 1024)    // capture 响应缓冲(transcript+reply+records)
+#define RESP_SIZE    (4 * 1024)    // capture 响应缓冲(transcript+reply+records)
 #define CAPTURE_TIMEOUT_MS 30000   // ASR+LLM 在服务端,给足余量
 
 static bool s_mounted;
 static bool s_audio_ready;
+
+// 录音与回放共用的 PCM 块(同一任务内串行,互不重叠)
+static uint8_t s_pcm_chunk[JIANLU_REC_CHUNK_BYTES];
 
 esp_err_t jianlu_capture_init(void)
 {
@@ -65,7 +70,11 @@ bool jianlu_capture_pending_exists(void)
 static esp_err_t audio_prepare(void)
 {
     if (!s_audio_ready) {
+        ESP_LOGD(TAG, "rec: bsp_audio_init 开始(堆 %u, 最大块 %u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)esp_get_minimum_free_heap_size());
         esp_err_t err = bsp_audio_init();
+        ESP_LOGD(TAG, "rec: bsp_audio_init → %s", esp_err_to_name(err));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "音频初始化失败: %s", esp_err_to_name(err));
             return err;
@@ -73,14 +82,24 @@ static esp_err_t audio_prepare(void)
         s_audio_ready = true;
     }
     // 录音任务独占音频,无并发格式切换;bsp_audio_set_format 同格式调用是廉价的。
-    return bsp_audio_set_format(JIANLU_VOICE_SAMPLE_RATE, 16, 1);
+    ESP_LOGD(TAG, "rec: set_format 开始");
+    esp_err_t err = bsp_audio_set_format(JIANLU_VOICE_SAMPLE_RATE, 16, 1);
+    ESP_LOGD(TAG, "rec: set_format → %s", esp_err_to_name(err));
+    return err;
+}
+
+esp_err_t jianlu_capture_prepare_audio(void)
+{
+    return audio_prepare();
 }
 
 esp_err_t jianlu_capture_record(jianlu_rec_poll_t poll, void *user, size_t *pcm_bytes)
 {
     *pcm_bytes = 0;
+    ESP_LOGD(TAG, "rec: audio_prepare 前");
     esp_err_t err = audio_prepare();
     if (err != ESP_OK) return err;
+    ESP_LOGD(TAG, "rec: 格式就绪,打开文件");
 
     FILE *f = fopen(REC_PATH, "wb");
     if (f == NULL) {
@@ -94,22 +113,23 @@ esp_err_t jianlu_capture_record(jianlu_rec_poll_t poll, void *user, size_t *pcm_
         return ESP_FAIL;
     }
 
-    static uint8_t chunk[JIANLU_REC_CHUNK_BYTES];   // 静态:录音任务独占,不占栈
     size_t total = 0;
     bool stop = false;
+    ESP_LOGD(TAG, "rec: 进入读循环");
     while (!stop && total < JIANLU_VOICE_MAX_BYTES) {
-        err = bsp_audio_read(chunk, sizeof(chunk));
+        err = bsp_audio_read(s_pcm_chunk, sizeof(s_pcm_chunk));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "I2S 读失败: %s", esp_err_to_name(err));
             break;
         }
-        if (fwrite(chunk, 1, sizeof(chunk), f) != sizeof(chunk)) {
+        if (fwrite(s_pcm_chunk, 1, sizeof(s_pcm_chunk), f) != sizeof(s_pcm_chunk)) {
             ESP_LOGW(TAG, "录音写文件失败");
             err = ESP_FAIL;
             break;
         }
-        total += sizeof(chunk);
-        if (poll != NULL && !poll(user)) stop = true;
+        total += sizeof(s_pcm_chunk);
+        if ((total & 0xFFFF) == 0) ESP_LOGD(TAG, "rec: %u 字节", (unsigned)total);
+        if (poll != NULL && !poll(user, s_pcm_chunk, sizeof(s_pcm_chunk))) stop = true;
     }
     fflush(f);
 
@@ -133,6 +153,38 @@ void jianlu_capture_discard(void)
     remove(REC_PATH);
 }
 
+esp_err_t jianlu_capture_play_pending(volatile bool *stop_flag, size_t *played_bytes)
+{
+    if (played_bytes) *played_bytes = 0;
+    esp_err_t err = audio_prepare();
+    if (err != ESP_OK) return err;
+
+    FILE *f = fopen(PENDING_PATH, "rb");
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
+    // 跳过 WAV 头(本应用自产,固定 44 字节)
+    if (fseek(f, JIANLU_WAV_HEADER_LEN, SEEK_SET) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    size_t played = 0;
+    for (;;) {
+        if (stop_flag != NULL && *stop_flag) break;
+        size_t got = fread(s_pcm_chunk, 1, sizeof(s_pcm_chunk), f);
+        if (got == 0) break;
+        err = bsp_audio_write(s_pcm_chunk, got);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "回放写 I2S 失败: %s", esp_err_to_name(err));
+            break;
+        }
+        played += got;
+    }
+    fclose(f);
+    if (played_bytes) *played_bytes = played;
+    ESP_LOGI(TAG, "回放结束: %u 字节%s", (unsigned)played,
+             (stop_flag != NULL && *stop_flag) ? "(按键停止)" : "");
+    return err;
+}
+
 static const char *upload_path(bool use_pending)
 {
     return use_pending ? PENDING_PATH : REC_PATH;
@@ -140,6 +192,7 @@ static const char *upload_path(bool use_pending)
 
 esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *result)
 {
+    if (jianlu_hub_base()[0] == '\0') return ESP_ERR_INVALID_STATE;
     const char *path = upload_path(use_pending);
     FILE *f = fopen(path, "rb");
     if (f == NULL) return ESP_ERR_NOT_FOUND;
@@ -151,11 +204,14 @@ esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *resul
         return ESP_ERR_INVALID_SIZE;
     }
 
+    char capture_url[JIANLU_HUB_URL_LEN + 24];
+    snprintf(capture_url, sizeof(capture_url), "%s/api/device/capture",
+             jianlu_hub_base());
     esp_http_client_config_t config = {
-        .url = CONFIG_XIAONUO_HUB_URL "/api/device/capture",
+        .url = capture_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = CAPTURE_TIMEOUT_MS,
-        .buffer_size = 2048,
+        .buffer_size = 1024,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
@@ -164,31 +220,48 @@ esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *resul
     }
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
 
-    static char resp[RESP_SIZE];   // 静态:网络任务独占
+    size_t scratch_len = 0;
+    uint8_t *scratch = jianlu_net_scratch(&scratch_len);   // 上传块与响应共用,时序不重叠
+    if (scratch_len < RESP_SIZE + 16) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    char *resp = (char *)scratch;
     size_t resp_len = 0;
+    ESP_LOGD(TAG, "up: open(len=%ld)", fsize);
     esp_err_t err = esp_http_client_open(client, fsize);
+    ESP_LOGD(TAG, "up: open → %s", esp_err_to_name(err));
     if (err == ESP_OK) {
-        static uint8_t buf[HTTP_CHUNK];
         size_t sent = 0;
         while (sent < (size_t)fsize) {
             size_t want = (size_t)fsize - sent;
-            if (want > sizeof(buf)) want = sizeof(buf);
-            size_t got = fread(buf, 1, want, f);
+            if (want > HTTP_CHUNK) want = HTTP_CHUNK;
+            size_t got = fread(scratch, 1, want, f);
             if (got == 0) { err = ESP_FAIL; break; }
-            int written = esp_http_client_write(client, (const char *)buf, (int)got);
-            if (written < 0) { err = ESP_FAIL; break; }
+            int written = esp_http_client_write(client, (const char *)scratch, (int)got);
+            ESP_LOGD(TAG, "up: chunk %u→%d", (unsigned)sent, written);
+            if (written <= 0) { err = ESP_FAIL; break; }   // 0=超时未发,<=0 都视为失败
             sent += (size_t)written;
         }
+        ESP_LOGD(TAG, "up: 发送 %u/%ld → %s", (unsigned)sent, fsize,
+                 esp_err_to_name(err));
     }
     fclose(f);
 
     int status = 0;
     if (err == ESP_OK) {
+        ESP_LOGD(TAG, "up: 等待应答…");
         int64_t clen = esp_http_client_fetch_headers(client);
         status = esp_http_client_get_status_code(client);
+        ESP_LOGD(TAG, "up: HTTP %d (clen=%lld)", status, (long long)clen);
         if (clen > 0) {
-            int r = esp_http_client_read(client, resp, sizeof(resp) - 1);
-            if (r > 0) resp_len = (size_t)r;
+            // esp_http_client_read 单次可能只给一部分,循环读满
+            while (resp_len < RESP_SIZE - 1) {
+                int r = esp_http_client_read(client, resp + resp_len,
+                                             RESP_SIZE - 1 - resp_len);
+                if (r <= 0) break;
+                resp_len += (size_t)r;
+            }
         }
     }
     esp_http_client_close(client);

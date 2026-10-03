@@ -7,17 +7,35 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "jianlu_json.h"
+#include "jianlu_nvs.h"
 
 static const char *TAG = "jianlu_hub";
 
-// 16KB 静态响应缓冲:20 条记录(标题 96B + 摘要 128B + JSON 开销)正常 <10KB。
-// 不走堆,避免和 Wi-Fi/LVGL 抢碎片。
-#define HUB_BODY_SIZE (16 * 1024)
+// 9KB 静态缓冲:12 条记录(标题 96B + 摘要 128B + JSON 开销)正常 <7KB。
+// 不走堆,避免和 Wi-Fi/LVGL 抢碎片;也是全网络任务的共享刮擦区。
+#define HUB_BODY_SIZE (9 * 1024)
 #define HUB_TIMEOUT_MS 8000
 
 static char s_body[HUB_BODY_SIZE];
 static size_t s_body_len;
 static bool s_body_overflow;
+static char s_base[JIANLU_HUB_URL_LEN];
+
+uint8_t *jianlu_net_scratch(size_t *len)
+{
+    *len = HUB_BODY_SIZE;
+    return (uint8_t *)s_body;
+}
+
+void jianlu_hub_set_base(const char *url)
+{
+    jianlu_utf8_copy(s_base, sizeof(s_base), url, sizeof(s_base) - 1);
+}
+
+const char *jianlu_hub_base(void)
+{
+    return s_base;
+}
 
 static esp_err_t on_http_event(esp_http_client_event_t *evt)
 {
@@ -40,9 +58,13 @@ static void set_err(char *errbuf, size_t errbuf_len, const char *msg)
 
 esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_len)
 {
+    if (s_base[0] == '\0') {
+        set_err(errbuf, errbuf_len, "中枢地址未设置");
+        return ESP_ERR_INVALID_STATE;
+    }
     char url[160];
     int n = snprintf(url, sizeof(url), "%s/api/records?status=pending&pageSize=%d",
-                     CONFIG_XIAONUO_HUB_URL, JIANLU_MAX_RECORDS);
+                     s_base, JIANLU_MAX_RECORDS);
     if (n <= 0 || (size_t)n >= sizeof(url)) {
         set_err(errbuf, errbuf_len, "中枢地址过长");
         return ESP_ERR_INVALID_ARG;
@@ -92,9 +114,9 @@ esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_le
 
 esp_err_t jianlu_hub_complete(const char *id)
 {
+    if (s_base[0] == '\0') return ESP_ERR_INVALID_STATE;
     char url[192];
-    int n = snprintf(url, sizeof(url), "%s/api/records/%s",
-                     CONFIG_XIAONUO_HUB_URL, id);
+    int n = snprintf(url, sizeof(url), "%s/api/records/%s", s_base, id);
     if (n <= 0 || (size_t)n >= sizeof(url)) return ESP_ERR_INVALID_ARG;
 
     esp_http_client_config_t config = {
