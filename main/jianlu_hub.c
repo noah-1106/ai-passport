@@ -3,11 +3,13 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "jianlu_json.h"
 #include "jianlu_nvs.h"
+#include "jianlu_timefmt.h"
 
 static const char *TAG = "jianlu_hub";
 
@@ -20,6 +22,7 @@ static char s_body[HUB_BODY_SIZE];
 static size_t s_body_len;
 static bool s_body_overflow;
 static char s_base[JIANLU_HUB_URL_LEN];
+static char s_resp_date[40];   // 响应 Date 头(对时用)
 
 uint8_t *jianlu_net_scratch(size_t *len)
 {
@@ -39,6 +42,12 @@ const char *jianlu_hub_base(void)
 
 static esp_err_t on_http_event(esp_http_client_event_t *evt)
 {
+    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key != NULL &&
+        strcasecmp(evt->header_key, "Date") == 0 && evt->header_value != NULL) {
+        jianlu_utf8_copy(s_resp_date, sizeof(s_resp_date), evt->header_value,
+                         sizeof(s_resp_date) - 1);
+        return ESP_OK;
+    }
     if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL) return ESP_OK;
     if (s_body_len + (size_t)evt->data_len > sizeof(s_body)) {
         s_body_overflow = true;
@@ -72,6 +81,7 @@ esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_le
 
     s_body_len = 0;
     s_body_overflow = false;
+    s_resp_date[0] = '\0';
 
     esp_http_client_config_t config = {
         .url = url,
@@ -109,6 +119,15 @@ esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_le
         return ESP_ERR_INVALID_RESPONSE;
     }
     ESP_LOGI(TAG, "拉到 %d 条简录", count);
+    // 顺手对时:中枢 Date 头 → 本机时间(录音时间戳用)
+    if (s_resp_date[0] != '\0') {
+        uint32_t epoch = jianlu_time_parse_http_date(s_resp_date);
+        if (jianlu_time_is_valid(epoch)) {
+            struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "已对时: %s", s_resp_date);
+        }
+    }
     return ESP_OK;
 }
 

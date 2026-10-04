@@ -24,8 +24,9 @@ esp_err_t jianlu_capture_init(void);
 esp_err_t jianlu_capture_prepare_audio(void);
 
 // ---- 队列状态 ----
-int jianlu_capture_queue_count(void);    // 队列深度 0..4
-bool jianlu_capture_queue_full(void);    // 满 4 槽或分区剩余不足(此时禁止再录)
+int jianlu_capture_queue_count(void);    // 队列深度(不设条数上限)
+bool jianlu_capture_queue_full(void);    // 分区剩余不足约 3s 录音(此时禁止再录)
+uint32_t jianlu_capture_slot_ts(int slot); // 槽位录音时刻 epoch(0=未对时)
 
 // 录音回调:返回 false 立即停止(用于松开检测/时长上限)。
 // 在录音任务上下文调用,每次写入一块 PCM 后触发;pcm/len 为本块数据

@@ -272,6 +272,12 @@ static void deck_apply(const jianlu_store_t *store)
     if (store->count < 2) lv_obj_add_flag(s_slots[1], LV_OBJ_FLAG_HIDDEN);
 
     const jianlu_record_t *rec = jianlu_store_selected(store);
+    if (rec == NULL) {   // 防御:选中失效时不渲染内容,只留空卡(崩溃防护)
+        for (int i = 0; i < 3; i++) {
+            lv_obj_add_flag(s_slots[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
     bool pending = rec->completing || rec->sync_pending;
     lv_obj_set_style_bg_color(s_badge, badge_color(rec->type), 0);
     lv_label_set_text(s_badge_text,

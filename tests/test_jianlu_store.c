@@ -145,6 +145,13 @@ static void test_voice_placeholder(void) {
         assert(jianlu_store_is_voice_placeholder(&store.records[i]));
         assert(store.records[i].voice_slot == i + 1);
         assert(strcmp(store.records[i].title, "语音 · 未识别") == 0);
+        // 合成记录全字段安全(渲染路径不判 NULL,依赖字段全为非空 C 串)
+        assert(store.records[i].id[0] != '\0');
+        assert(store.records[i].summary[0] != '\0');
+        assert(store.records[i].tag_count == 0);
+        assert(store.records[i].date[0] == '\0');
+        assert(!store.records[i].completing);
+        assert(!store.records[i].sync_pending);
     }
     assert(!jianlu_store_is_voice_placeholder(&store.records[3]));
     assert(strcmp(jianlu_store_selected(&store)->id, "b") == 0);
@@ -162,6 +169,31 @@ static void test_voice_placeholder(void) {
     assert(!jianlu_store_is_voice_placeholder(NULL));
 }
 
+static void test_voice_placeholder_empty_store(void) {
+    // 崩溃回归:空清单插占位卡,选中必须落在有效卡上(曾 selected==count
+    // 导致 jianlu_store_selected 返回 NULL,渲染空指针解引用)
+    jianlu_store_t store;
+    jianlu_store_init(&store);   // count=0,selected=0
+
+    assert(jianlu_store_set_voice_placeholders(&store, 3) == 3);
+    assert(store.count == 3);
+    assert(store.selected == 0);                    // 落在第一张占位卡
+    const jianlu_record_t *sel = jianlu_store_selected(&store);
+    assert(sel != NULL);
+    assert(jianlu_store_is_voice_placeholder(sel));
+
+    // 重复同步(模拟每次事件后的重建)选中始终有效
+    assert(jianlu_store_set_voice_placeholders(&store, 3) == 3);
+    assert(jianlu_store_selected(&store) != NULL);
+    assert(jianlu_store_set_voice_placeholders(&store, 2) == 2);
+    assert(store.selected < store.count);
+    assert(jianlu_store_selected(&store) != NULL);
+
+    // 清空占位后空清单选中复位
+    assert(jianlu_store_set_voice_placeholders(&store, 0) == 0);
+    assert(jianlu_store_selected(&store) == NULL);   // count==0 时为 NULL(合法)
+}
+
 int main(void) {
     test_utf8_copy();
     test_add_move_wrap();
@@ -170,5 +202,6 @@ int main(void) {
     test_completing_and_types();
     test_view_error();
     test_voice_placeholder();
+    test_voice_placeholder_empty_store();
     return 0;
 }

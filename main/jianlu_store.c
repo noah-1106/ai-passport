@@ -144,6 +144,7 @@ int jianlu_store_set_voice_placeholders(jianlu_store_t *store, int count)
 {
     if (count < 0) count = 0;
     if (count > JIANLU_VOICEQ_SLOTS) count = JIANLU_VOICEQ_SLOTS;
+    bool was_empty = store->count == 0;
     remove_all_placeholders(store);
     if (count == 0) return 0;
 
@@ -153,7 +154,11 @@ int jianlu_store_set_voice_placeholders(jianlu_store_t *store, int count)
     memmove(&store->records[count], &store->records[0],
             (size_t)store->count * sizeof(store->records[0]));
     store->count += count;
-    store->selected += count;
+    // 空清单插占位卡:选中落在第一张(0);非空:原选中跟随下移
+    store->selected = was_empty ? 0 : store->selected + count;
+    if (store->selected >= store->count) {
+        store->selected = store->count > 0 ? store->count - 1 : 0;
+    }
     for (int i = 0; i < count; i++) {
         jianlu_record_t *rec = &store->records[i];
         memset(rec, 0, sizeof(*rec));

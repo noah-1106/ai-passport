@@ -11,8 +11,10 @@
 #include "esp_spiffs.h"
 #include "esp_task_wdt.h"
 #include "jianlu_hub.h"
+#include "jianlu_timefmt.h"
 #include "jianlu_voice.h"
 #include "jianlu_voiceq.h"
+#include <sys/time.h>
 
 static const char *TAG = "jianlu_cap";
 
@@ -47,7 +49,9 @@ static bool wav_valid(const char *path)
     return ok;
 }
 
-// 删除指定槽并把后面的槽下移,保持连续
+// 删除指定槽并把后面的槽下移,保持连续(时间戳同步移动,元数据落盘)
+static void save_meta(void);
+
 static void delete_and_shift(int slot)
 {
     char from[24], to[24];
@@ -62,13 +66,53 @@ static void delete_and_shift(int slot)
             rename(from, to);
         }
     }
-    if (s_queue.count > 0) s_queue.count--;
+    jianlu_voiceq_remove_at(&s_queue, slot);
+    save_meta();
+}
+
+#define META_PATH "/voicefs/vq.meta"
+
+static bool s_rebuilding;
+
+static void save_meta(void)
+{
+    if (s_rebuilding) return;
+    static uint8_t buf[8 + JIANLU_VOICEQ_SLOTS * 4];
+    size_t n = jianlu_voiceq_encode(&s_queue, buf, sizeof(buf));
+    if (n == 0) return;
+    FILE *f = fopen(META_PATH, "wb");
+    if (f == NULL) return;
+    fwrite(buf, 1, n, f);
+    fclose(f);
+}
+
+static void load_meta(void)
+{
+    static uint8_t buf[8 + JIANLU_VOICEQ_SLOTS * 4];
+    FILE *f = fopen(META_PATH, "rb");
+    if (f == NULL) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size > 0 && (size_t)size <= sizeof(buf) &&
+        fread(buf, 1, (size_t)size, f) == (size_t)size) {
+        jianlu_voiceq_t meta = { 0 };
+        if (jianlu_voiceq_decode(buf, (size_t)size, &meta) &&
+            meta.count <= s_queue.count) {
+            // 以磁盘文件为准,时间戳尽量对齐(数量不一致时保留前 N 个)
+            memcpy(s_queue.ts, meta.ts,
+                   (size_t)(meta.count < s_queue.count ? meta.count
+                                                       : s_queue.count) * sizeof(uint32_t));
+        }
+    }
+    fclose(f);
 }
 
 // 从磁盘重建队列深度(p1..pN 连续即 N;坏头文件顺带清理)
 static void count_from_disk(void)
 {
-    s_queue.count = 0;
+    s_rebuilding = true;
+    jianlu_voiceq_init(&s_queue);
     char path[24];
     for (int i = 1; i <= JIANLU_VOICEQ_SLOTS; i++) {
         slot_path(i, path, sizeof(path));
@@ -83,6 +127,8 @@ static void count_from_disk(void)
         }
         s_queue.count = i;
     }
+    s_rebuilding = false;
+    load_meta();
 }
 
 // 迁移旧版单槽 pending.wav → p1.wav
@@ -138,10 +184,17 @@ int jianlu_capture_queue_count(void)
     return s_queue.count;
 }
 
+// 槽位录音时刻(0=未对时/未知)
+uint32_t jianlu_capture_slot_ts(int slot)
+{
+    if (slot < 1 || slot > s_queue.count) return 0;
+    return s_queue.ts[slot - 1];
+}
+
 bool jianlu_capture_queue_full(void)
 {
     if (!s_mounted) return false;
-    if (jianlu_voiceq_full(&s_queue)) return true;
+    // 不设条数上限:只按剩余空间管理(不足约 3s 录音即视为满)
     size_t total = 0, used = 0;
     if (esp_spiffs_info("voicefs", &total, &used) != ESP_OK) return true;
     size_t free_b = total > used ? total - used : 0;
@@ -222,10 +275,13 @@ esp_err_t jianlu_capture_record(jianlu_rec_poll_t poll, void *user, size_t *pcm_
     }
     fclose(f);
     if (err == ESP_OK && total > 0) {
-        jianlu_voiceq_push(&s_queue);
-        ESP_LOGI(TAG, "录音结束: %u 字节 PCM 入槽(队列 %d/%d)%s", (unsigned)total,
-                 s_queue.count, JIANLU_VOICEQ_SLOTS,
-                 total >= JIANLU_VOICE_MAX_BYTES ? "(到上限)" : "");
+        // 录音时刻(未对过时为 0,占位卡回退显示"待同步")
+        time_t now = time(NULL);
+        uint32_t ts = jianlu_time_is_valid((uint32_t)now) ? (uint32_t)now : 0;
+        jianlu_voiceq_push(&s_queue, ts);
+        save_meta();
+        ESP_LOGI(TAG, "录音结束: %u 字节 PCM 入槽(队列 %d)%s", (unsigned)total,
+                 s_queue.count, total >= JIANLU_VOICE_MAX_BYTES ? "(到上限)" : "");
     } else {
         remove(path);   // 失败/空录音:清掉半成品,不占槽
     }
@@ -362,11 +418,12 @@ esp_err_t jianlu_capture_upload_head(jianlu_capture_result_t *result)
     esp_http_client_cleanup(client);
 
     if (err == ESP_OK && status == 200) {
+        // 先删档再解析:任何后续崩溃都不会导致同一条录音重复上传(幂等)
+        delete_and_shift(1);
         resp[resp_len] = '\0';
         if (jianlu_json_parse_capture(resp, resp_len, result) == 0) {
             ESP_LOGI(TAG, "上传成功: transcript=\"%s\" 新增 %d 条(队列剩 %d)",
-                     result->transcript, result->new_count, s_queue.count - 1);
-            delete_and_shift(1);
+                     result->transcript, result->new_count, s_queue.count);
             return ESP_OK;
         }
         ESP_LOGW(TAG, "capture 响应解析失败");

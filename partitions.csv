@@ -1,6 +1,7 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x760000,
-# 语音暂存:按住说话录 16kHz/16bit/mono,15s 上限 480KB + WAV 头 + SPIFFS 开销。
-voicefs,  data, spiffs,  0x770000, 0x90000,
+factory,  app,  factory, 0x10000, 0x3F0000,
+# 语音队列分区 4MB:队列只按剩余空间管理,不设条数上限。
+# 注意:本布局与旧版不兼容,升级需整片重刷(见发布说明)。
+voicefs,  data, spiffs,  0x400000, 0x400000,

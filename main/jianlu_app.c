@@ -34,11 +34,13 @@
 #include "jianlu_discover.h"
 #include "jianlu_hub.h"
 #include "jianlu_level.h"
+#include "jianlu_modal.h"
 #include "jianlu_netflow.h"
 #include "jianlu_nvs.h"
 #include "jianlu_offline.h"
 #include "jianlu_powersave.h"
 #include "jianlu_provision.h"
+#include "jianlu_timefmt.h"
 #include "jianlu_tone.h"
 #include "jianlu_ui.h"
 #include "jianlu_voice.h"
@@ -115,6 +117,15 @@ static jianlu_ps_t s_ps;
 static char s_mdns_url[JIANLU_HUB_URL_LEN];
 static int s_connect_fails;
 static char s_prev_top_id[JIANLU_ID_LEN];
+// 显式同步:提示页 → OK 逐条上传(进度)→ 汇总页
+static bool s_sync_prompt;       // 「发现离线内容」提示页显示中
+static bool s_summary_shown;     // 汇总页显示中
+static bool s_drain_active;      // 补传进行中(屏蔽按键)
+static int s_drain_total;        // 开始时 语音队列+离线勾选 总数
+static int s_drain_done;         // 已处理条数
+static int s_drain_new_cards;    // 累计新增卡片数
+static int s_drain_syncq_total;  // 开始时离线勾选数
+static int s_drain_syncq_done;   // 已同步勾选项数
 static bool s_prov_running;
 static bool s_reprov_confirm;        // 重配确认页显示中
 static bool s_screen_off;            // 背光已熄(省电)
@@ -417,7 +428,7 @@ static bool ensure_worker_tasks(void)
     s_job_queue = xQueueCreate(JOB_QUEUE_DEPTH, sizeof(net_job_t));
     s_rec_queue = xQueueCreate(1, sizeof(rec_cmd_type_t));
     if (!s_job_queue || !s_rec_queue) return false;
-    if (xTaskCreate(net_task, "jianlu_net", 5120, NULL, 4, NULL) != pdPASS ||
+    if (xTaskCreate(net_task, "jianlu_net", 6144, NULL, 4, NULL) != pdPASS ||
         xTaskCreate(rec_task, "jianlu_rec", 4096, NULL, 6, NULL) != pdPASS) {
         ESP_LOGE(TAG, "网络/录音任务创建失败");
         return false;
@@ -460,7 +471,8 @@ static esp_err_t wifi_teardown(void)
     return esp_wifi_deinit();
 }
 
-// 中枢地址确定:设置 → (mDNS 结果存 NVS)→ LOADING → 补传/同步/拉清单
+// 中枢地址确定:设置 → (mDNS 结果存 NVS)→ LOADING。
+// 有离线内容(语音队列/离线勾选)时显式提示,不自动补传。
 static void hub_ready(const char *url, jianlu_hub_src_t src)
 {
     jianlu_hub_set_base(url);
@@ -468,17 +480,84 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
     ESP_LOGI(TAG, "中枢: %s(来源 %d)", url, (int)src);
     jianlu_netflow_event(&s_nf, JIANLU_NF_HUB_READY);
     apply_view(JIANLU_ANIM_NONE);
-    // 依次串行:语音队列补传 → 离线勾选同步 → 拉清单
-    if (jianlu_capture_queue_count() > 0) {
-        ESP_LOGI(TAG, "发现 %d 条待补传录音,逐条补传", jianlu_capture_queue_count());
-        request_capture();
+
+    int pending = jianlu_capture_queue_count() + s_syncq.count;
+    if (pending > 0 && !s_drain_active) {
+        s_sync_prompt = true;
+        char body[48];
+        snprintf(body, sizeof(body), "共 %d 条待同步", pending);
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay("发现离线内容", 0xE8A33D, body,
+                              "OK 开始同步 · 其他键跳过");
+            bsp_lvgl_unlock();
+        }
+        ESP_LOGI(TAG, "发现 %d 条离线内容,等待用户确认同步", pending);
     }
-    if (s_syncq.count > 0) {
-        ESP_LOGI(TAG, "发现 %d 条离线勾选,先同步", s_syncq.count);
+    request_fetch();   // 清单照常拉取(提示页覆盖其上)
+}
+
+// OK 确认开始补传:先语音队列(逐条进度),再离线勾选,最后汇总
+static void drain_start(void)
+{
+    s_sync_prompt = false;
+    s_drain_active = true;
+    s_drain_done = 0;
+    s_drain_new_cards = 0;
+    s_drain_syncq_total = s_syncq.count;
+    s_drain_syncq_done = 0;
+    s_drain_total = jianlu_capture_queue_count() + s_syncq.count;
+    ESP_LOGI(TAG, "开始同步 %d 条离线内容", s_drain_total);
+    if (jianlu_capture_queue_count() > 0) {
+        request_capture();
+    } else if (s_syncq.count > 0) {
         net_job_t job = { .type = JOB_SYNC };
         (void)xQueueSend(s_job_queue, &job, 0);
     }
-    request_fetch();
+}
+
+static void drain_progress_show(const char *transcript)
+{
+    char body[96];
+    if (transcript != NULL && transcript[0] != '\0') {
+        char prefix[32];
+        jianlu_utf8_copy(prefix, sizeof(prefix), transcript, 24);
+        snprintf(body, sizeof(body), "正在识别 %d/%d:%s",
+                 s_drain_done, s_drain_total, prefix);
+    } else {
+        snprintf(body, sizeof(body), "正在识别 %d/%d…",
+                 s_drain_done, s_drain_total);
+    }
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_overlay("正在同步", 0xE8A33D, body, "请稍候");
+        bsp_lvgl_unlock();
+    }
+}
+
+static void drain_summary_show(void)
+{
+    s_drain_active = false;
+    s_summary_shown = true;
+    jianlu_tone_play(JIANLU_TONE_SUCCESS);
+    char body[96];
+    snprintf(body, sizeof(body), "新增 %d 张卡片 · %d 条勾选已同步",
+             s_drain_new_cards, s_drain_syncq_done);
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_overlay("同步完成", 0xE8A33D, body, "OK 返回");
+        bsp_lvgl_unlock();
+    }
+    ESP_LOGI(TAG, "同步完成: 新增 %d 张卡片,勾选 %d 条",
+             s_drain_new_cards, s_drain_syncq_done);
+}
+
+static void drain_abort_show(void)
+{
+    s_drain_active = false;
+    s_summary_shown = true;   // OK 返回逻辑同汇总页
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_overlay("同步中断", 0xD96A5A,
+                          "网络不通,剩余内容已保留", "OK 返回");
+        bsp_lvgl_unlock();
+    }
 }
 
 static void offline_retry_cb(void *arg)
@@ -487,10 +566,25 @@ static void offline_retry_cb(void *arg)
     post_event(EV_OFFLINE_RETRY, 0, 0, NULL);
 }
 
-// 队列录音 ⇄ 清单顶部占位卡(每条一卡,可单独回放)同步
+// 队列录音 ⇄ 清单顶部占位卡(每条一卡,可单独回放)同步;
+// 标题带录音时刻(已对时)或"待同步"(未对时)
 static void sync_voice_placeholder(void)
 {
-    jianlu_store_set_voice_placeholders(&s_store, jianlu_capture_queue_count());
+    int n = jianlu_store_set_voice_placeholders(&s_store,
+                                                jianlu_capture_queue_count());
+    for (int i = 0; i < n; i++) {
+        uint32_t ts = jianlu_capture_slot_ts(i + 1);
+        char title[JIANLU_TITLE_LEN];
+        if (jianlu_time_is_valid(ts)) {
+            char when[16];
+            jianlu_time_format_mmdd_hhmm(ts, when, sizeof(when));
+            snprintf(title, sizeof(title), "离线语音 %s", when);
+        } else {
+            snprintf(title, sizeof(title), "离线语音 · 待同步");
+        }
+        jianlu_utf8_copy(s_store.records[i].title, JIANLU_TITLE_LEN, title,
+                         JIANLU_TITLE_LEN - 1);
+    }
 }
 
 // 进入离线模式(快照可用时):装快照、定期重试;无快照返回 false
@@ -588,6 +682,19 @@ static void voice_dismiss(void)
     if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_DISMISS)) {
         if (s_confirm_timer) esp_timer_stop(s_confirm_timer);
         voice_ui(s_voice.state, 0);
+        // 新鲜录音处理完,队列里还有存量 → 重新提示显式同步
+        if (jianlu_capture_queue_count() > 0 && !s_drain_active) {
+            s_sync_prompt = true;
+            char body[48];
+            snprintf(body, sizeof(body), "共 %d 条待同步",
+                     jianlu_capture_queue_count() + s_syncq.count);
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay("发现离线内容", 0xE8A33D, body,
+                                  "OK 开始同步 · 其他键跳过");
+                bsp_lvgl_unlock();
+            }
+            return;
+        }
         if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
             s_nf = JIANLU_NF_LOADING;
             apply_view(JIANLU_ANIM_NONE);
@@ -644,6 +751,51 @@ static void on_key_event(const app_ev_t *ev)
     if (s_playing) {
         s_play_stop = true;
         return;
+    }
+    // 补传进行中:屏蔽按键(进度/汇总由补传流程驱动)
+    if (s_drain_active) return;
+    // 汇总/中断页 + 「发现离线内容」提示:模态按键路由表(jianlu_modal)
+    {
+        jianlu_modal_t modal = s_sync_prompt ? JIANLU_MODAL_SYNC_PROMPT
+                             : s_summary_shown ? JIANLU_MODAL_SUMMARY
+                             : JIANLU_MODAL_NONE;
+        jianlu_modal_act_t act = jianlu_modal_key(modal, (int)ev->btn,
+                                                  (int)ev->btn_ev);
+        if (act != JIANLU_MODAL_PASS) {
+            switch (act) {
+            case JIANLU_MODAL_SWALLOW:
+                return;   // PRESS/双击/长按:吞掉不关页
+            case JIANLU_MODAL_SKIP:
+                s_sync_prompt = false;
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_hide();
+                    bsp_lvgl_unlock();
+                }
+                return;
+            case JIANLU_MODAL_START_SYNC:
+                s_sync_prompt = false;
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_hide();
+                    bsp_lvgl_unlock();
+                }
+                drain_start();
+                return;
+            case JIANLU_MODAL_DISMISS:
+                s_summary_shown = false;
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_hide();
+                    bsp_lvgl_unlock();
+                }
+                if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+                    s_nf = JIANLU_NF_LOADING;
+                    apply_view(JIANLU_ANIM_NONE);
+                    request_fetch();
+                }
+                return;
+            default:
+                return;
+            }
+        }
     }
     // 分页查看器:UP/DOWN 翻页,OK 关闭并返回
     if (jianlu_ui_pager_is_open()) {
@@ -968,7 +1120,14 @@ static void app_task(void *arg)
         case EV_CAPTURE_DONE: {
             esp_err_t err = (esp_err_t)ev.arg1;
             sync_voice_placeholder();   // 任何结果都把队列状态落到 UI(修占位卡残影)
+            bool server_reject = err == ESP_ERR_INVALID_RESPONSE
+                              || err == ESP_ERR_INVALID_SIZE;
             if (err == ESP_OK) {
+                if (s_drain_active) {
+                    s_drain_done++;
+                    s_drain_new_cards += s_capture_result.new_count;
+                    drain_progress_show(s_capture_result.transcript);
+                }
                 if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_SEND_OK)) {
                     jianlu_tone_play(JIANLU_TONE_SUCCESS);
                     // 内容超一页进分页模式:取消自动返回,等用户翻页读完
@@ -979,21 +1138,31 @@ static void app_task(void *arg)
                     }
                 }
             } else {
+                if (s_drain_active) {
+                    if (server_reject) {
+                        s_drain_done++;   // 拒收也算处理过(文件已删)
+                        drain_progress_show(NULL);
+                    } else {
+                        drain_abort_show();   // 传输层失败:保留剩余,停止本轮
+                    }
+                }
                 if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_SEND_FAIL)) {
                     jianlu_tone_play(JIANLU_TONE_FAIL);
                     voice_ui(s_voice.state, 0);
                     schedule_confirm_dismiss();
                 }
-                // 传输层失败(连不上中枢):保留队头,停止本轮补传
             }
             ui_refresh(JIANLU_ANIM_NONE);
-            // 补传循环:成功或中枢拒收(文件已删)且队列非空 → 继续下一条;
-            // 传输层失败(文件保留)→ 停下等下次联网
-            bool server_done = err == ESP_OK || err == ESP_ERR_INVALID_RESPONSE
-                            || err == ESP_ERR_INVALID_SIZE;
-            if (server_done && jianlu_capture_queue_count() > 0
-                && jianlu_hub_base()[0] != '\0') {
-                request_capture();
+            // 显式补传循环:成功/拒收 → 续下一条;空队列 → 勾选回放 → 汇总
+            if (s_drain_active) {
+                if (jianlu_capture_queue_count() > 0) {
+                    request_capture();
+                } else if (s_syncq.count > 0) {
+                    net_job_t job = { .type = JOB_SYNC };
+                    (void)xQueueSend(s_job_queue, &job, 0);
+                } else {
+                    drain_summary_show();
+                }
             }
             break;
         }
@@ -1007,6 +1176,10 @@ static void app_task(void *arg)
             break;
         case EV_SYNC_DONE:
             jianlu_offline_load_syncq(&s_syncq);   // 与文件对齐(网络任务已改)
+            if (s_drain_active) {
+                s_drain_syncq_done = s_drain_syncq_total - (int)ev.arg2;
+                drain_summary_show();
+            }
             break;
         case EV_OFFLINE_RETRY:
             if (s_store.offline && s_wifi_connected && jianlu_hub_base()[0] != '\0') {
