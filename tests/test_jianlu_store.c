@@ -137,29 +137,29 @@ static void test_voice_placeholder(void) {
     jianlu_store_replace_end(&store);
     store.selected = 1;
 
-    // 插入占位卡到 0 号位,选中跟随下移
-    assert(jianlu_store_ensure_voice_placeholder(&store));
-    assert(store.count == 3);
-    assert(store.selected == 2);
-    assert(jianlu_store_is_voice_placeholder(&store.records[0]));
-    assert(strcmp(store.records[0].id, JIANLU_VOICE_PLACEHOLDER_ID) == 0);
-    assert(strcmp(store.records[0].title, "语音 · 未识别") == 0);
+    // 3 张占位卡置顶(对应槽 1..3),选中跟随下移
+    assert(jianlu_store_set_voice_placeholders(&store, 3) == 3);
+    assert(store.count == 5);
+    assert(store.selected == 4);
+    for (int i = 0; i < 3; i++) {
+        assert(jianlu_store_is_voice_placeholder(&store.records[i]));
+        assert(store.records[i].voice_slot == i + 1);
+        assert(strcmp(store.records[i].title, "语音 · 未识别") == 0);
+    }
+    assert(!jianlu_store_is_voice_placeholder(&store.records[3]));
     assert(strcmp(jianlu_store_selected(&store)->id, "b") == 0);
 
-    // 幂等:重复插入不翻倍
-    assert(jianlu_store_ensure_voice_placeholder(&store));
+    // 精确同步为 1 张:多余的消失,槽位重排为 1
+    assert(jianlu_store_set_voice_placeholders(&store, 1) == 1);
     assert(store.count == 3);
-
-    // 普通记录不被误判
+    assert(store.records[0].voice_slot == 1);
     assert(!jianlu_store_is_voice_placeholder(&store.records[1]));
-    assert(!jianlu_store_is_voice_placeholder(NULL));
 
-    // 移除占位卡,选中跟随回移
-    assert(jianlu_store_remove_voice_placeholder(&store));
+    // 清空
+    assert(jianlu_store_set_voice_placeholders(&store, 0) == 0);
     assert(store.count == 2);
-    assert(store.selected == 1);
     assert(strcmp(jianlu_store_selected(&store)->id, "b") == 0);
-    assert(!jianlu_store_remove_voice_placeholder(&store));
+    assert(!jianlu_store_is_voice_placeholder(NULL));
 }
 
 int main(void) {

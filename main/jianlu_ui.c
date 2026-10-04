@@ -60,6 +60,10 @@ static lv_obj_t *s_conf_badge_text;
 static lv_obj_t *s_conf_title;
 static lv_obj_t *s_pager_ind;
 static lv_obj_t *s_flash;
+static lv_obj_t *s_flash_l1;
+static lv_obj_t *s_flash_l2;
+static lv_obj_t *s_flash_title;
+static lv_obj_t *s_flash_body;
 static lv_timer_t *s_flash_timer;
 
 // 分页查看器状态(text 在 s_pager_full 内,与 pager 同生命周期)
@@ -420,7 +424,7 @@ static const char *status_text(const jianlu_store_t *store)
 static void voice_build(lv_obj_t *scr)
 {
     s_voice_panel = panel_create(scr, 10, 46, 220, 240, UI_BG, 12);
-    lv_obj_set_style_bg_opa(s_voice_panel, LV_OPA_90, 0);
+    lv_obj_set_style_bg_opa(s_voice_panel, LV_OPA_COVER, 0);   // 不透明,不透底卡文字
     lv_obj_set_style_border_width(s_voice_panel, 1, 0);
     lv_obj_set_style_border_color(s_voice_panel, lv_color_hex(UI_ACCENT), 0);
     lv_obj_set_style_border_opa(s_voice_panel, LV_OPA_40, 0);
@@ -499,6 +503,10 @@ static void flash_hide(lv_timer_t *timer)
 
 void jianlu_ui_success_flash(void)
 {
+    lv_obj_add_flag(s_flash_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_flash_body, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_flash_l1, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_flash_l2, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
     if (s_flash_timer) lv_timer_delete(s_flash_timer);
     s_flash_timer = lv_timer_create(flash_hide, 800, NULL);
@@ -507,7 +515,7 @@ void jianlu_ui_success_flash(void)
 
 static void flash_build(lv_obj_t *scr)
 {
-    s_flash = panel_create(scr, 80, 130, 80, 60, UI_CARD_TOP, 12);
+    s_flash = panel_create(scr, 70, 120, 100, 80, UI_CARD_TOP, 12);
     lv_obj_set_style_border_width(s_flash, 1, 0);
     lv_obj_set_style_border_color(s_flash, lv_color_hex(UI_ACCENT), 0);
     lv_obj_set_style_border_opa(s_flash, LV_OPA_40, 0);
@@ -515,20 +523,28 @@ static void flash_build(lv_obj_t *scr)
     // 对勾:两条 lv_line(短撇 + 长捺),坐标相对 line 对象
     static lv_point_precise_t s_pts1[2];
     static lv_point_precise_t s_pts2[2];
-    s_pts1[0].x = 22; s_pts1[0].y = 30;
-    s_pts1[1].x = 34; s_pts1[1].y = 42;
-    s_pts2[0].x = 34; s_pts2[0].y = 42;
-    s_pts2[1].x = 58; s_pts2[1].y = 16;
-    lv_obj_t *l1 = lv_line_create(s_flash);
-    lv_line_set_points(l1, s_pts1, 2);
-    lv_obj_set_style_line_width(l1, 5, 0);
-    lv_obj_set_style_line_color(l1, lv_color_hex(UI_ACCENT), 0);
-    lv_obj_set_style_line_rounded(l1, true, 0);
-    lv_obj_t *l2 = lv_line_create(s_flash);
-    lv_line_set_points(l2, s_pts2, 2);
-    lv_obj_set_style_line_width(l2, 5, 0);
-    lv_obj_set_style_line_color(l2, lv_color_hex(UI_ACCENT), 0);
-    lv_obj_set_style_line_rounded(l2, true, 0);
+    s_pts1[0].x = 32; s_pts1[0].y = 42;
+    s_pts1[1].x = 44; s_pts1[1].y = 54;
+    s_pts2[0].x = 44; s_pts2[0].y = 54;
+    s_pts2[1].x = 68; s_pts2[1].y = 28;
+    s_flash_l1 = lv_line_create(s_flash);
+    lv_line_set_points(s_flash_l1, s_pts1, 2);
+    lv_obj_set_style_line_width(s_flash_l1, 5, 0);
+    lv_obj_set_style_line_color(s_flash_l1, lv_color_hex(UI_ACCENT), 0);
+    lv_obj_set_style_line_rounded(s_flash_l1, true, 0);
+    s_flash_l2 = lv_line_create(s_flash);
+    lv_line_set_points(s_flash_l2, s_pts2, 2);
+    lv_obj_set_style_line_width(s_flash_l2, 5, 0);
+    lv_obj_set_style_line_color(s_flash_l2, lv_color_hex(UI_ACCENT), 0);
+    lv_obj_set_style_line_rounded(s_flash_l2, true, 0);
+
+    // 文字模式(overlay_flash 用,默认隐藏)
+    s_flash_title = text_create(s_flash, 0, 12, 100, UI_INK);
+    lv_obj_set_style_text_align(s_flash_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_flash_title, LV_OBJ_FLAG_HIDDEN);
+    s_flash_body = text_create(s_flash, 10, 40, 80, UI_DIM);
+    lv_obj_set_style_text_align(s_flash_body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_flash_body, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_add_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
 }
@@ -752,6 +768,24 @@ void jianlu_ui_overlay(const char *title, uint32_t color_hex,
 void jianlu_ui_overlay_hide(void)
 {
     jianlu_ui_voice_idle();
+}
+
+// 短暂提示浮层(1.5s 自动消失,不拦截按键):复用 flash 面板
+void jianlu_ui_overlay_flash(const char *title, uint32_t color_hex, const char *body)
+{
+    static char safe[64];
+    sanitize_text(safe, sizeof(safe), body);
+    lv_obj_add_flag(s_flash_l1, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_flash_l2, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_flash_title, title ? title : "");
+    lv_obj_set_style_text_color(s_flash_title, lv_color_hex(color_hex), 0);
+    lv_label_set_text(s_flash_body, safe);
+    lv_obj_remove_flag(s_flash_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_flash_body, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
+    if (s_flash_timer) lv_timer_delete(s_flash_timer);
+    s_flash_timer = lv_timer_create(flash_hide, 1500, NULL);
+    lv_timer_set_repeat_count(s_flash_timer, 1);
 }
 
 // ---------------------------------------------------------------------------

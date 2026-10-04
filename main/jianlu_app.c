@@ -86,7 +86,7 @@ typedef struct {
 typedef enum {
     JOB_FETCH = 0,
     JOB_COMPLETE,
-    JOB_CAPTURE,         // id 字段复用为 use_pending 标志("1"=补传)
+    JOB_CAPTURE,         // 语音队列:上传队头一条
     JOB_DISCOVER,        // mDNS 找中枢
     JOB_SYNC,            // 离线待同步队列回放
 } job_type_t;
@@ -127,6 +127,7 @@ static esp_timer_handle_t s_confirm_timer;
 static volatile bool s_wifi_connected;
 static volatile bool s_playing;      // 本地回放中
 static volatile bool s_play_stop;    // 任意键请求停止回放
+static int s_play_slot;              // 回放目标槽位 1..4
 
 // BLUFI 回调 → 事件 的载荷(单生产者单消费者,经队列串行化,静态即可)
 static char s_prov_ssid[JIANLU_NVS_SSID_LEN];
@@ -291,7 +292,7 @@ static void rec_task(void *arg)
         if (cmd == REC_CMD_PLAY) {
             size_t played = 0;
             s_play_stop = false;
-            esp_err_t err = jianlu_capture_play_pending(&s_play_stop, &played);
+            esp_err_t err = jianlu_capture_play_slot(s_play_slot, &s_play_stop, &played);
             post_event(EV_PLAY_DONE, (int32_t)err, (int32_t)played, NULL);
         } else {
             s_poll_state.bytes = 0;
@@ -347,9 +348,9 @@ static void net_task(void *arg)
             ESP_LOGI(TAG, "待同步回放: %d 条剩 %d 条", total, q.count);
             post_event(EV_SYNC_DONE, (int32_t)err, q.count, NULL);
         } else {
-            bool use_pending = job.id[0] == '1';
-            esp_err_t err = jianlu_capture_upload(use_pending, &s_capture_result);
-            post_event(EV_CAPTURE_DONE, (int32_t)err, use_pending ? 1 : 0, NULL);
+            // 语音队列:只打头(FIFO);队列循环由应用任务按结果驱动
+            esp_err_t err = jianlu_capture_upload_head(&s_capture_result);
+            post_event(EV_CAPTURE_DONE, (int32_t)err, 0, NULL);
         }
         esp_task_wdt_reset();
         esp_task_wdt_delete(NULL);
@@ -394,10 +395,10 @@ static void request_fetch(void)
     (void)xQueueSend(s_job_queue, &job, 0);
 }
 
-static void request_capture(bool use_pending)
+static void request_capture(void)
 {
     if (!s_job_queue) return;
-    net_job_t job = { .type = JOB_CAPTURE, .id = { use_pending ? '1' : '0', '\0' } };
+    net_job_t job = { .type = JOB_CAPTURE };
     (void)xQueueSend(s_job_queue, &job, 0);
 }
 
@@ -467,10 +468,10 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
     ESP_LOGI(TAG, "中枢: %s(来源 %d)", url, (int)src);
     jianlu_netflow_event(&s_nf, JIANLU_NF_HUB_READY);
     apply_view(JIANLU_ANIM_NONE);
-    // 依次串行:遗留录音补传 → 离线勾选同步 → 拉清单
-    if (jianlu_voice_should_retry_pending(jianlu_capture_pending_exists(), true)) {
-        ESP_LOGI(TAG, "发现待补传录音,先补传");
-        request_capture(true);
+    // 依次串行:语音队列补传 → 离线勾选同步 → 拉清单
+    if (jianlu_capture_queue_count() > 0) {
+        ESP_LOGI(TAG, "发现 %d 条待补传录音,逐条补传", jianlu_capture_queue_count());
+        request_capture();
     }
     if (s_syncq.count > 0) {
         ESP_LOGI(TAG, "发现 %d 条离线勾选,先同步", s_syncq.count);
@@ -486,14 +487,10 @@ static void offline_retry_cb(void *arg)
     post_event(EV_OFFLINE_RETRY, 0, 0, NULL);
 }
 
-// pending.wav ⇄ 清单顶部语音占位卡 同步
+// 队列录音 ⇄ 清单顶部占位卡(每条一卡,可单独回放)同步
 static void sync_voice_placeholder(void)
 {
-    if (jianlu_capture_pending_exists()) {
-        jianlu_store_ensure_voice_placeholder(&s_store);
-    } else {
-        jianlu_store_remove_voice_placeholder(&s_store);
-    }
+    jianlu_store_set_voice_placeholders(&s_store, jianlu_capture_queue_count());
 }
 
 // 进入离线模式(快照可用时):装快照、定期重试;无快照返回 false
@@ -681,6 +678,16 @@ static void on_key_event(const app_ev_t *ev)
     if (ev->btn == BSP_BTN_OK && ev->btn_ev == BSP_BTN_LONG) {
         // 按住说话开始(松开由录音任务轮询 ADC 判定)
         if (jianlu_hub_base()[0] == '\0' || !s_rec_queue) return;   // 中枢未确定,语音无意义
+        if (jianlu_capture_queue_full()) {
+            // 队列满:拒录并提示(绝不静默覆盖最老录音)
+            ESP_LOGW(TAG, "语音队列已满,拒绝录音");
+            jianlu_tone_play(JIANLU_TONE_FAIL);
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay_flash("队列已满", 0xD96A5A, "请先联网同步语音");
+                bsp_lvgl_unlock();
+            }
+            return;
+        }
         if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_HOLD_START)) {
             ESP_LOGI(TAG, "开始录音(按住说话)");
             jianlu_tone_play(JIANLU_TONE_REC_START);
@@ -714,9 +721,10 @@ static void on_key_event(const app_ev_t *ev)
         const jianlu_record_t *rec = jianlu_store_selected(&s_store);
         if (rec == NULL) return;
         if (jianlu_store_is_voice_placeholder(rec)) {
-            // 语音占位卡:OK = 本地回放
+            // 语音占位卡:OK = 本地回放对应槽位
             if (s_playing || !s_rec_queue) return;
             s_playing = true;
+            s_play_slot = rec->voice_slot;
             if (bsp_lvgl_lock(500)) {
                 jianlu_ui_overlay("播放中", 0xE8A33D, "语音 · 未识别",
                                   "任意键停止");
@@ -943,20 +951,24 @@ static void app_task(void *arg)
             if (send) send = jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_STOP)
                           && s_voice.state == JIANLU_VOICE_SENDING;
             if (!send) {
-                jianlu_capture_discard();   // 误触(太短)或录音失败
+                // 误触太短(文件已入槽)才需要清尾槽;拒录/读错误根本未入槽
+                if ((esp_err_t)ev.arg1 == ESP_OK) jianlu_capture_discard_tail();
+                sync_voice_placeholder();
+                ui_refresh(JIANLU_ANIM_NONE);
                 voice_ui(JIANLU_VOICE_IDLE, 0);
                 break;
             }
             ESP_LOGI(TAG, "录音 %d 字节,开始上传", (int)s_voice.recorded_bytes);
+            sync_voice_placeholder();   // 新录音入槽,占位卡立即可见(可回放)
+            ui_refresh(JIANLU_ANIM_NONE);
             voice_ui(s_voice.state, 0);
-            request_capture(false);
+            request_capture();
             break;
         }
         case EV_CAPTURE_DONE: {
-            bool use_pending = ev.arg2 == 1;
-            if ((esp_err_t)ev.arg1 == ESP_OK) {
-                jianlu_capture_delete(use_pending);
-                sync_voice_placeholder();   // 补传成功:占位卡随 pending 消失
+            esp_err_t err = (esp_err_t)ev.arg1;
+            sync_voice_placeholder();   // 任何结果都把队列状态落到 UI(修占位卡残影)
+            if (err == ESP_OK) {
                 if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_SEND_OK)) {
                     jianlu_tone_play(JIANLU_TONE_SUCCESS);
                     // 内容超一页进分页模式:取消自动返回,等用户翻页读完
@@ -967,23 +979,22 @@ static void app_task(void *arg)
                     }
                 }
             } else {
-                sync_voice_placeholder();   // 失败:pending 保留,占位卡顶上
                 if (jianlu_voice_event(&s_voice, JIANLU_VOICE_EV_SEND_FAIL)) {
                     jianlu_tone_play(JIANLU_TONE_FAIL);
                     voice_ui(s_voice.state, 0);
                     schedule_confirm_dismiss();
                 }
-                // pending 补传失败:静默,文件继续保留等下次联网
-#if VOICE_LINK_SELFTEST
-                if (!use_pending) {
-                    ESP_LOGI(TAG, "[SELFTEST] 上传失败,自动回放 pending 验证回放链路");
-                    s_playing = true;
-                    rec_cmd_type_t cmd = REC_CMD_PLAY;
-                    (void)xQueueSend(s_rec_queue, &cmd, 0);
-                }
-#endif
+                // 传输层失败(连不上中枢):保留队头,停止本轮补传
             }
             ui_refresh(JIANLU_ANIM_NONE);
+            // 补传循环:成功或中枢拒收(文件已删)且队列非空 → 继续下一条;
+            // 传输层失败(文件保留)→ 停下等下次联网
+            bool server_done = err == ESP_OK || err == ESP_ERR_INVALID_RESPONSE
+                            || err == ESP_ERR_INVALID_SIZE;
+            if (server_done && jianlu_capture_queue_count() > 0
+                && jianlu_hub_base()[0] != '\0') {
+                request_capture();
+            }
             break;
         }
         case EV_PLAY_DONE:

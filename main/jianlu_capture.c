@@ -12,20 +12,103 @@
 #include "esp_task_wdt.h"
 #include "jianlu_hub.h"
 #include "jianlu_voice.h"
+#include "jianlu_voiceq.h"
 
 static const char *TAG = "jianlu_cap";
 
-#define REC_PATH     "/voicefs/rec.wav"
-#define PENDING_PATH "/voicefs/pending.wav"
 #define HTTP_CHUNK   2048          // 上传分块
 #define RESP_SIZE    (4 * 1024)    // capture 响应缓冲(transcript+reply+records)
 #define CAPTURE_TIMEOUT_MS 30000   // ASR+LLM 在服务端,给足余量
+#define QUEUE_LOW_KB 96            // 分区剩余低于此值视为队列满(约 3s 录音余量)
+#define OLD_PENDING_PATH "/voicefs/pending.wav"
 
 static bool s_mounted;
 static bool s_audio_ready;
+static jianlu_voiceq_t s_queue;
 
 // 录音与回放共用的 PCM 块(同一任务内串行,互不重叠)
 static uint8_t s_pcm_chunk[JIANLU_REC_CHUNK_BYTES];
+
+static void slot_path(int slot, char *buf, size_t len)
+{
+    snprintf(buf, len, "/voicefs/p%d.wav", slot);
+}
+
+// 校验文件是有效 WAV(分区首次使用可能挂着旧数据的垃圾)
+static bool wav_valid(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return false;
+    char head[12] = { 0 };
+    bool ok = fread(head, 1, sizeof(head), f) == sizeof(head)
+           && memcmp(head, "RIFF", 4) == 0
+           && memcmp(head + 8, "WAVE", 4) == 0;
+    fclose(f);
+    return ok;
+}
+
+// 删除指定槽并把后面的槽下移,保持连续
+static void delete_and_shift(int slot)
+{
+    char from[24], to[24];
+    slot_path(slot, to, sizeof(to));
+    remove(to);
+    for (int i = slot; i < JIANLU_VOICEQ_SLOTS; i++) {
+        slot_path(i + 1, from, sizeof(from));
+        slot_path(i, to, sizeof(to));
+        FILE *probe = fopen(from, "r");
+        if (probe != NULL) {
+            fclose(probe);
+            rename(from, to);
+        }
+    }
+    if (s_queue.count > 0) s_queue.count--;
+}
+
+// 从磁盘重建队列深度(p1..pN 连续即 N;坏头文件顺带清理)
+static void count_from_disk(void)
+{
+    s_queue.count = 0;
+    char path[24];
+    for (int i = 1; i <= JIANLU_VOICEQ_SLOTS; i++) {
+        slot_path(i, path, sizeof(path));
+        FILE *f = fopen(path, "r");
+        if (f == NULL) break;
+        fclose(f);
+        if (!wav_valid(path)) {
+            ESP_LOGW(TAG, "%s 头无效,清理", path);
+            delete_and_shift(i);
+            i--;   // 下移后同槽位是新文件,重查
+            continue;
+        }
+        s_queue.count = i;
+    }
+}
+
+// 迁移旧版单槽 pending.wav → p1.wav
+static void migrate_legacy_pending(void)
+{
+    FILE *f = fopen(OLD_PENDING_PATH, "r");
+    if (f == NULL) return;
+    fclose(f);
+    char p1[24];
+    slot_path(1, p1, sizeof(p1));
+    FILE *probe = fopen(p1, "r");
+    if (probe != NULL) {
+        fclose(probe);
+        ESP_LOGW(TAG, "旧 pending.wav 与 p1 并存,删除旧文件");
+        remove(OLD_PENDING_PATH);
+        return;
+    }
+    if (!wav_valid(OLD_PENDING_PATH)) {
+        ESP_LOGW(TAG, "旧 pending.wav 头无效,删除");
+        remove(OLD_PENDING_PATH);
+        return;
+    }
+    if (rename(OLD_PENDING_PATH, p1) == 0) {
+        ESP_LOGI(TAG, "旧版 pending.wav 已迁移为 p1.wav");
+    }
+}
 
 esp_err_t jianlu_capture_init(void)
 {
@@ -45,37 +128,30 @@ esp_err_t jianlu_capture_init(void)
     size_t total = 0, used = 0;
     esp_spiffs_info("voicefs", &total, &used);
     ESP_LOGI(TAG, "voicefs 挂载: %u/%u 字节已用", (unsigned)used, (unsigned)total);
+    migrate_legacy_pending();
+    count_from_disk();
     return ESP_OK;
 }
 
-bool jianlu_capture_pending_exists(void)
+int jianlu_capture_queue_count(void)
+{
+    return s_queue.count;
+}
+
+bool jianlu_capture_queue_full(void)
 {
     if (!s_mounted) return false;
-    FILE *f = fopen(PENDING_PATH, "r");
-    if (f == NULL) return false;
-    // 校验 WAV 头:voicefs 区域首次使用可能挂着旧数据的"垃圾文件",
-    // 不是 RIFF/WAVE 的直接清掉,避免把垃圾补传给中枢。
-    char head[12] = { 0 };
-    bool valid = fread(head, 1, sizeof(head), f) == sizeof(head)
-              && memcmp(head, "RIFF", 4) == 0
-              && memcmp(head + 8, "WAVE", 4) == 0;
-    fclose(f);
-    if (!valid) {
-        ESP_LOGW(TAG, "pending 文件头无效,已删除(可能来自旧分区数据)");
-        remove(PENDING_PATH);
-        return false;
-    }
-    return true;
+    if (jianlu_voiceq_full(&s_queue)) return true;
+    size_t total = 0, used = 0;
+    if (esp_spiffs_info("voicefs", &total, &used) != ESP_OK) return true;
+    size_t free_b = total > used ? total - used : 0;
+    return free_b < (size_t)QUEUE_LOW_KB * 1024;
 }
 
 static esp_err_t audio_prepare(void)
 {
     if (!s_audio_ready) {
-        ESP_LOGD(TAG, "rec: bsp_audio_init 开始(堆 %u, 最大块 %u)",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)esp_get_minimum_free_heap_size());
         esp_err_t err = bsp_audio_init();
-        ESP_LOGD(TAG, "rec: bsp_audio_init → %s", esp_err_to_name(err));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "音频初始化失败: %s", esp_err_to_name(err));
             return err;
@@ -83,10 +159,7 @@ static esp_err_t audio_prepare(void)
         s_audio_ready = true;
     }
     // 录音任务独占音频,无并发格式切换;bsp_audio_set_format 同格式调用是廉价的。
-    ESP_LOGD(TAG, "rec: set_format 开始");
-    esp_err_t err = bsp_audio_set_format(JIANLU_VOICE_SAMPLE_RATE, 16, 1);
-    ESP_LOGD(TAG, "rec: set_format → %s", esp_err_to_name(err));
-    return err;
+    return bsp_audio_set_format(JIANLU_VOICE_SAMPLE_RATE, 16, 1);
 }
 
 esp_err_t jianlu_capture_prepare_audio(void)
@@ -97,14 +170,18 @@ esp_err_t jianlu_capture_prepare_audio(void)
 esp_err_t jianlu_capture_record(jianlu_rec_poll_t poll, void *user, size_t *pcm_bytes)
 {
     *pcm_bytes = 0;
-    ESP_LOGD(TAG, "rec: audio_prepare 前");
+    if (jianlu_capture_queue_full()) {
+        ESP_LOGW(TAG, "队列已满,拒绝录音");
+        return ESP_ERR_NO_MEM;
+    }
     esp_err_t err = audio_prepare();
     if (err != ESP_OK) return err;
-    ESP_LOGD(TAG, "rec: 格式就绪,打开文件");
 
-    FILE *f = fopen(REC_PATH, "wb");
+    char path[24];
+    slot_path(s_queue.count + 1, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
     if (f == NULL) {
-        ESP_LOGE(TAG, "录音文件创建失败");
+        ESP_LOGE(TAG, "录音文件创建失败: %s", path);
         return ESP_FAIL;
     }
     uint8_t header[JIANLU_WAV_HEADER_LEN];
@@ -144,25 +221,36 @@ esp_err_t jianlu_capture_record(jianlu_rec_poll_t poll, void *user, size_t *pcm_
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "录音结束: %u 字节 PCM%s", (unsigned)total,
-             stop ? "(松开)" : (total >= JIANLU_VOICE_MAX_BYTES ? "(到上限)" : ""));
+    if (err == ESP_OK && total > 0) {
+        jianlu_voiceq_push(&s_queue);
+        ESP_LOGI(TAG, "录音结束: %u 字节 PCM 入槽(队列 %d/%d)%s", (unsigned)total,
+                 s_queue.count, JIANLU_VOICEQ_SLOTS,
+                 total >= JIANLU_VOICE_MAX_BYTES ? "(到上限)" : "");
+    } else {
+        remove(path);   // 失败/空录音:清掉半成品,不占槽
+    }
     return err;
 }
 
-void jianlu_capture_discard(void)
+void jianlu_capture_discard_tail(void)
 {
-    remove(REC_PATH);
+    if (s_queue.count > 0) {
+        ESP_LOGI(TAG, "丢弃队尾录音(队列 %d/%d)", s_queue.count, JIANLU_VOICEQ_SLOTS);
+        delete_and_shift(s_queue.count);
+    }
 }
 
-esp_err_t jianlu_capture_play_pending(volatile bool *stop_flag, size_t *played_bytes)
+esp_err_t jianlu_capture_play_slot(int slot, volatile bool *stop_flag,
+                                   size_t *played_bytes)
 {
     if (played_bytes) *played_bytes = 0;
     esp_err_t err = audio_prepare();
     if (err != ESP_OK) return err;
 
-    FILE *f = fopen(PENDING_PATH, "rb");
+    char path[24];
+    slot_path(slot, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
     if (f == NULL) return ESP_ERR_NOT_FOUND;
-    // 跳过 WAV 头(本应用自产,固定 44 字节)
     if (fseek(f, JIANLU_WAV_HEADER_LEN, SEEK_SET) != 0) {
         fclose(f);
         return ESP_FAIL;
@@ -182,27 +270,30 @@ esp_err_t jianlu_capture_play_pending(volatile bool *stop_flag, size_t *played_b
     }
     fclose(f);
     if (played_bytes) *played_bytes = played;
-    ESP_LOGI(TAG, "回放结束: %u 字节%s", (unsigned)played,
+    ESP_LOGI(TAG, "回放结束: 槽 %d %u 字节%s", slot, (unsigned)played,
              (stop_flag != NULL && *stop_flag) ? "(按键停止)" : "");
     return err;
 }
 
-static const char *upload_path(bool use_pending)
-{
-    return use_pending ? PENDING_PATH : REC_PATH;
-}
-
-esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *result)
+esp_err_t jianlu_capture_upload_head(jianlu_capture_result_t *result)
 {
     if (jianlu_hub_base()[0] == '\0') return ESP_ERR_INVALID_STATE;
-    const char *path = upload_path(use_pending);
+    if (jianlu_voiceq_head(&s_queue) < 0) return ESP_ERR_NOT_FOUND;
+
+    char path[24];
+    slot_path(1, path, sizeof(path));
     FILE *f = fopen(path, "rb");
-    if (f == NULL) return ESP_ERR_NOT_FOUND;
+    if (f == NULL) {
+        // 与磁盘脱节的兜底:对齐计数后按空队列报
+        count_from_disk();
+        return ESP_ERR_NOT_FOUND;
+    }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (fsize <= JIANLU_WAV_HEADER_LEN) {
         fclose(f);
+        delete_and_shift(1);   // 坏文件清掉,可继续下一条
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -226,6 +317,7 @@ esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *resul
     uint8_t *scratch = jianlu_net_scratch(&scratch_len);   // 上传块与响应共用,时序不重叠
     if (scratch_len < RESP_SIZE + 16) {
         fclose(f);
+        esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
     }
     char *resp = (char *)scratch;
@@ -269,37 +361,27 @@ esp_err_t jianlu_capture_upload(bool use_pending, jianlu_capture_result_t *resul
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "上传失败: %s", esp_err_to_name(err));
-        goto fail;
-    }
-    if (status != 200) {
-        ESP_LOGW(TAG, "上传失败: HTTP %d", status);
-        err = ESP_ERR_INVALID_RESPONSE;
-        goto fail;
-    }
-    resp[resp_len] = '\0';
-    if (jianlu_json_parse_capture(resp, resp_len, result) != 0) {
+    if (err == ESP_OK && status == 200) {
+        resp[resp_len] = '\0';
+        if (jianlu_json_parse_capture(resp, resp_len, result) == 0) {
+            ESP_LOGI(TAG, "上传成功: transcript=\"%s\" 新增 %d 条(队列剩 %d)",
+                     result->transcript, result->new_count, s_queue.count - 1);
+            delete_and_shift(1);
+            return ESP_OK;
+        }
         ESP_LOGW(TAG, "capture 响应解析失败");
         err = ESP_ERR_INVALID_RESPONSE;
-        goto fail;
-    }
-    ESP_LOGI(TAG, "上传成功: transcript=\"%s\" 新增 %d 条",
-             result->transcript, result->new_count);
-    return ESP_OK;
-
-fail:
-    // 传输层失败(连不上中枢)才保留 pending 待补传;
-    // 中枢已应答的失败(如静音被 ASR 拒收的 502)重传无意义,直接删除。
-    if (status == 0 && !use_pending) {
-        rename(REC_PATH, PENDING_PATH);
+    } else if (err == ESP_OK) {
+        ESP_LOGW(TAG, "上传失败: HTTP %d", status);
+        err = ESP_ERR_INVALID_RESPONSE;
     } else {
-        remove(upload_path(use_pending));
+        ESP_LOGW(TAG, "上传失败: %s", esp_err_to_name(err));
+    }
+
+    // 传输层失败(连不上中枢)才保留队头,应停止本轮补传;
+    // 中枢已应答的失败(拒收/解析失败)重传无意义,删除并可继续下一条。
+    if (err == ESP_ERR_INVALID_RESPONSE || err == ESP_ERR_INVALID_SIZE) {
+        delete_and_shift(1);
     }
     return err;
-}
-
-void jianlu_capture_delete(bool use_pending)
-{
-    remove(upload_path(use_pending));
 }

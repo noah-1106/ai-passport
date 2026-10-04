@@ -72,3 +72,5 @@ void jianlu_ui_provision_info(const char *dev_name, bool phone_connected);
 void jianlu_ui_overlay(const char *title, uint32_t color_hex,
                        const char *body, const char *hint);
 void jianlu_ui_overlay_hide(void);
+// 短暂提示浮层(1.5s 自动消失,不拦截按键),如"队列已满"。
+void jianlu_ui_overlay_flash(const char *title, uint32_t color_hex, const char *body);

@@ -22,6 +22,7 @@ idf_component_register(
          "jianlu_glyph.c"
          "jianlu_layout.c"
          "jianlu_pager.c"
+         "jianlu_voiceq.c"
          "../assets/fonts/jianlu_font_16.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_http_client esp_netif esp_timer esp_wifi json mbedtls nvs_flash spiffs

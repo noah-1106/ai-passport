@@ -113,8 +113,8 @@ static void test_syncq(void) {
 static void test_snapshot_excludes_voice_placeholder(void) {
     jianlu_store_t a, b;
     fill_store(&a, 2);
-    jianlu_store_ensure_voice_placeholder(&a);   // 占位卡进 0 号位
-    assert(a.count == 3);
+    jianlu_store_set_voice_placeholders(&a, 2);   // 2 张占位卡置顶
+    assert(a.count == 4);
 
     uint8_t buf[8192];
     size_t n = jianlu_snapshot_encode(&a, buf, sizeof(buf));
@@ -124,7 +124,7 @@ static void test_snapshot_excludes_voice_placeholder(void) {
     assert(jianlu_snapshot_decode(buf, n, &b));
     assert(b.count == 2);   // 占位卡不进快照
     for (int i = 0; i < b.count; i++) {
-        assert(!b.records[i].voice_placeholder);
+        assert(!jianlu_store_is_voice_placeholder(&b.records[i]));
     }
     assert(strcmp(b.records[0].id, "100") == 0);
 }

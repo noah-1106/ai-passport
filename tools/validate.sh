@@ -98,6 +98,10 @@ run_static_checks() {
         tests/test_jianlu_pager.c main/jianlu_pager.c \
         -o "${test_dir}/test_jianlu_pager"
     "${test_dir}/test_jianlu_pager"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_voiceq.c main/jianlu_voiceq.c \
+        -o "${test_dir}/test_jianlu_voiceq"
+    "${test_dir}/test_jianlu_voiceq"
     # JSON 解析测试直接编 ESP-IDF 源码树里的 cJSON;未激活 IDF 时跳过。
     if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/components/json/cJSON/cJSON.c" ]]; then
         "${CC:-cc}" -std=c11 -Wall -Wextra \

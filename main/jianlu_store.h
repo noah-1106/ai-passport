@@ -30,14 +30,15 @@ typedef struct {
     jianlu_type_t type;
     bool completing;    // 已发出完成请求、等待中枢确认
     bool sync_pending;  // 离线勾选,待联网同步
-    bool voice_placeholder; // 语音占位卡(未识别的 pending 录音,非中枢数据)
+    bool voice_placeholder; // 语音占位卡(未识别的排队录音,非中枢数据)
+    int  voice_slot;        // 占位卡对应的队列槽位 1..4;0 = 非占位卡
     char date[JIANLU_DATE_LEN];                 // createdAt 的日期部分,可为空串
     char tags[JIANLU_MAX_TAGS][JIANLU_TAG_LEN]; // 前 tag_count 个有效
     int tag_count;
 } jianlu_record_t;
 
-// 语音占位卡 id:以 0x01 开头,不可能与中枢的数字/字符串 id 冲突。
-#define JIANLU_VOICE_PLACEHOLDER_ID "\x01VOICE_PENDING"
+// 语音占位卡 id 前缀:以 0x01 开头,不可能与中枢的数字/字符串 id 冲突。
+#define JIANLU_VOICE_PLACEHOLDER_ID "\x01VOICE_P"
 
 // 视图状态机:UI 与网络事件都收敛到这里,刷新时只读它。
 typedef enum {
@@ -84,10 +85,11 @@ bool jianlu_store_set_completing(jianlu_store_t *store, const char *id, bool com
 // 按 id 标记/清除"离线待同步";返回是否找到。
 bool jianlu_store_set_sync_pending(jianlu_store_t *store, const char *id, bool pending);
 
-// ---- 语音占位卡(pending.wav 的清单内呈现)----
-// 插到 0 号位(已存在则不动,返回 true);清单满返回 false。
-bool jianlu_store_ensure_voice_placeholder(jianlu_store_t *store);
-bool jianlu_store_remove_voice_placeholder(jianlu_store_t *store);
+// ---- 语音占位卡(队列录音的清单内呈现)----
+// 精确同步为 N 张占位卡(N=队列深度 0..4):先移除全部旧占位卡,再把
+// 槽位 1..N 的卡依次插到清单顶部,选中跟随平移。返回实际放置的张数
+// (清单空间不足时少于 N)。
+int jianlu_store_set_voice_placeholders(jianlu_store_t *store, int count);
 bool jianlu_store_is_voice_placeholder(const jianlu_record_t *rec);
 
 // 按 id 删除并收敛选中项;返回是否找到。

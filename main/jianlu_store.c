@@ -1,7 +1,10 @@
 // main/jianlu_store.c —— 见 jianlu_store.h。纯 C,host 侧测试覆盖。
 #include "jianlu_store.h"
 
+#include <stdio.h>
 #include <string.h>
+
+#include "jianlu_voiceq.h"
 
 void jianlu_utf8_copy(char *dst, size_t dst_size, const char *src, size_t max_bytes)
 {
@@ -52,6 +55,7 @@ bool jianlu_store_add(jianlu_store_t *store, const char *id, const char *title,
     rec->completing = false;
     rec->sync_pending = false;
     rec->voice_placeholder = false;
+    rec->voice_slot = 0;
     // 日期只取 "YYYY-MM-DD" 前 10 字节(纯 ASCII,不涉及 UTF-8 边界)
     jianlu_utf8_copy(rec->date, sizeof(rec->date), date, 10);
     rec->tag_count = 0;
@@ -118,46 +122,52 @@ bool jianlu_store_set_sync_pending(jianlu_store_t *store, const char *id, bool p
 
 bool jianlu_store_is_voice_placeholder(const jianlu_record_t *rec)
 {
-    return rec != NULL && rec->voice_placeholder;
+    return rec != NULL && rec->voice_slot > 0;
 }
 
-bool jianlu_store_ensure_voice_placeholder(jianlu_store_t *store)
+// 移除全部语音占位卡;选中按移除数量回移
+static void remove_all_placeholders(jianlu_store_t *store)
 {
-    for (int i = 0; i < store->count; i++) {
-        if (store->records[i].voice_placeholder) return true;   // 已存在
-    }
-    if (store->count >= JIANLU_MAX_RECORDS) return false;
-    memmove(&store->records[1], &store->records[0],
-            (size_t)store->count * sizeof(store->records[0]));
-    store->count++;
-    store->selected++;   // 选中跟随原有卡片下移
-    jianlu_record_t *rec = &store->records[0];
-    memset(rec, 0, sizeof(*rec));
-    jianlu_utf8_copy(rec->id, sizeof(rec->id), JIANLU_VOICE_PLACEHOLDER_ID,
-                     sizeof(rec->id) - 1);
-    jianlu_utf8_copy(rec->title, sizeof(rec->title), "语音 · 未识别",
-                     sizeof(rec->title) - 1);
-    jianlu_utf8_copy(rec->summary, sizeof(rec->summary), "待同步",
-                     sizeof(rec->summary) - 1);
-    rec->type = JIANLU_TYPE_OTHER;
-    rec->voice_placeholder = true;
-    return true;
-}
-
-bool jianlu_store_remove_voice_placeholder(jianlu_store_t *store)
-{
-    for (int i = 0; i < store->count; i++) {
-        if (!store->records[i].voice_placeholder) continue;
+    for (int i = store->count - 1; i >= 0; i--) {
+        if (store->records[i].voice_slot <= 0) continue;
         memmove(&store->records[i], &store->records[i + 1],
                 (size_t)(store->count - i - 1) * sizeof(store->records[0]));
         store->count--;
         if (store->selected > i) store->selected--;
-        if (store->selected >= store->count) {
-            store->selected = store->count > 0 ? store->count - 1 : 0;
-        }
-        return true;
     }
-    return false;
+    if (store->selected >= store->count) {
+        store->selected = store->count > 0 ? store->count - 1 : 0;
+    }
+}
+
+int jianlu_store_set_voice_placeholders(jianlu_store_t *store, int count)
+{
+    if (count < 0) count = 0;
+    if (count > JIANLU_VOICEQ_SLOTS) count = JIANLU_VOICEQ_SLOTS;
+    remove_all_placeholders(store);
+    if (count == 0) return 0;
+
+    int space = JIANLU_MAX_RECORDS - store->count;
+    if (count > space) count = space;
+    // 整体后移 count 位,槽位 1..count 依次置顶
+    memmove(&store->records[count], &store->records[0],
+            (size_t)store->count * sizeof(store->records[0]));
+    store->count += count;
+    store->selected += count;
+    for (int i = 0; i < count; i++) {
+        jianlu_record_t *rec = &store->records[i];
+        memset(rec, 0, sizeof(*rec));
+        snprintf(rec->id, sizeof(rec->id), "%s%d",
+                 JIANLU_VOICE_PLACEHOLDER_ID, i + 1);
+        jianlu_utf8_copy(rec->title, sizeof(rec->title), "语音 · 未识别",
+                         sizeof(rec->title) - 1);
+        jianlu_utf8_copy(rec->summary, sizeof(rec->summary), "待同步",
+                         sizeof(rec->summary) - 1);
+        rec->type = JIANLU_TYPE_OTHER;
+        rec->voice_placeholder = true;
+        rec->voice_slot = i + 1;
+    }
+    return count;
 }
 
 bool jianlu_store_remove(jianlu_store_t *store, const char *id)
