@@ -282,23 +282,26 @@ static bool rec_poll(void *user, const uint8_t *pcm, size_t len)
 static void rec_task(void *arg)
 {
     (void)arg;
-    esp_task_wdt_add(NULL);
     rec_cmd_type_t cmd;
     for (;;) {
-        esp_task_wdt_reset();
-        if (xQueueReceive(s_rec_queue, &cmd, pdMS_TO_TICKS(5000)) != pdTRUE) continue;
+        // 空闲等命令时不挂看门狗(永久阻塞是正常态);
+        // 只在真正干活(录音/回放)期间挂狗,卡死才会被抓。
+        if (xQueueReceive(s_rec_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
+        esp_task_wdt_add(NULL);
         if (cmd == REC_CMD_PLAY) {
             size_t played = 0;
             s_play_stop = false;
             esp_err_t err = jianlu_capture_play_pending(&s_play_stop, &played);
             post_event(EV_PLAY_DONE, (int32_t)err, (int32_t)played, NULL);
-            continue;
+        } else {
+            s_poll_state.bytes = 0;
+            s_poll_state.last_sec = 0;
+            size_t pcm_bytes = 0;
+            esp_err_t err = jianlu_capture_record(rec_poll, &s_poll_state, &pcm_bytes);
+            post_event(EV_REC_DONE, (int32_t)err, (int32_t)pcm_bytes, NULL);
         }
-        s_poll_state.bytes = 0;
-        s_poll_state.last_sec = 0;
-        size_t pcm_bytes = 0;
-        esp_err_t err = jianlu_capture_record(rec_poll, &s_poll_state, &pcm_bytes);
-        post_event(EV_REC_DONE, (int32_t)err, (int32_t)pcm_bytes, NULL);
+        esp_task_wdt_reset();
+        esp_task_wdt_delete(NULL);
     }
 }
 
@@ -308,11 +311,12 @@ static void rec_task(void *arg)
 static void net_task(void *arg)
 {
     (void)arg;
-    esp_task_wdt_add(NULL);
     net_job_t job;
     for (;;) {
-        esp_task_wdt_reset();
-        if (xQueueReceive(s_job_queue, &job, pdMS_TO_TICKS(5000)) != pdTRUE) continue;
+        // 空闲等任务时不挂狗;执行作业期间挂狗(HTTP/mDNS 可能长达 30s+,
+        // 超时 40s 覆盖,真卡死才触发)
+        if (xQueueReceive(s_job_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+        esp_task_wdt_add(NULL);
         if (job.type == JOB_FETCH) {
             s_fetch_err[0] = '\0';
             s_fetch_busy = true;
@@ -347,6 +351,8 @@ static void net_task(void *arg)
             esp_err_t err = jianlu_capture_upload(use_pending, &s_capture_result);
             post_event(EV_CAPTURE_DONE, (int32_t)err, use_pending ? 1 : 0, NULL);
         }
+        esp_task_wdt_reset();
+        esp_task_wdt_delete(NULL);
     }
 }
 
@@ -755,7 +761,11 @@ static void light_sleep_once(void)
     gpio_set_direction(GPIO_NUM_0, GPIO_MODE_INPUT);
     gpio_wakeup_enable(GPIO_NUM_0, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
+    // 睡前摘狗:睡眠中无法喂,醒后第一时间挂回并喂,杜绝醒后竞态误触发
+    esp_task_wdt_delete(NULL);
     esp_light_sleep_start();
+    esp_task_wdt_add(NULL);
+    esp_task_wdt_reset();
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
     // 醒后恢复按键 ADC(bsp_button_init 可重复调用)
     bsp_button_init(on_key, NULL);

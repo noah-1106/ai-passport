@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_task_wdt.h"
 #include "jianlu_hub.h"
 #include "jianlu_voice.h"
 
@@ -172,6 +173,7 @@ esp_err_t jianlu_capture_play_pending(volatile bool *stop_flag, size_t *played_b
         size_t got = fread(s_pcm_chunk, 1, sizeof(s_pcm_chunk), f);
         if (got == 0) break;
         err = bsp_audio_write(s_pcm_chunk, got);
+        esp_task_wdt_reset();   // 回放全程挂狗,逐块喂
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "回放写 I2S 失败: %s", esp_err_to_name(err));
             break;

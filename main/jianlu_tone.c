@@ -97,11 +97,11 @@ static void play_seq(const tone_note_t *seq, size_t notes)
 static void tone_task(void *arg)
 {
     (void)arg;
-    esp_task_wdt_add(NULL);
     jianlu_tone_t tone;
     for (;;) {
-        esp_task_wdt_reset();
-        if (xQueueReceive(s_queue, &tone, pdMS_TO_TICKS(5000)) != pdTRUE) continue;
+        // 空闲等音符时不挂狗;播放期间挂狗
+        if (xQueueReceive(s_queue, &tone, portMAX_DELAY) != pdTRUE) continue;
+        esp_task_wdt_add(NULL);
         switch (tone) {
         case JIANLU_TONE_REC_START:
             play_seq(SEQ_REC_START, sizeof(SEQ_REC_START) / sizeof(tone_note_t));
@@ -116,6 +116,8 @@ static void tone_task(void *arg)
             play_seq(SEQ_FAIL, sizeof(SEQ_FAIL) / sizeof(tone_note_t));
             break;
         }
+        esp_task_wdt_reset();
+        esp_task_wdt_delete(NULL);
     }
 }
 
