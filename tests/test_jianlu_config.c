@@ -21,5 +21,18 @@ int main(void) {
     assert(jianlu_config_pick_hub("", NULL, "http://nvs:3000") == JIANLU_HUB_NVS);
     assert(jianlu_config_pick_hub(NULL, NULL, NULL) == JIANLU_HUB_NONE);
     assert(jianlu_config_pick_hub("", "", "") == JIANLU_HUB_NONE);
+
+    // 图片缓存下载决策
+    // 中枢已无此图:一律失效(删缓存清版本),与版本/缓存无关
+    assert(jianlu_dl_decide(false, 100, 100, true) == JIANLU_DL_INVALIDATE);
+    assert(jianlu_dl_decide(false, 0, 0, false) == JIANLU_DL_INVALIDATE);
+    // 有图 + 版本未变 + 缓存在:跳过(不换图秒进)
+    assert(jianlu_dl_decide(true, 100, 100, true) == JIANLU_DL_SKIP);
+    // 有图 + 版本变化(换图):下载
+    assert(jianlu_dl_decide(true, 200, 100, true) == JIANLU_DL_NEED);
+    // 首次(无版本记录):下载
+    assert(jianlu_dl_decide(true, 100, 0, true) == JIANLU_DL_NEED);
+    // 版本未变但缓存丢失(被清/损坏):下载
+    assert(jianlu_dl_decide(true, 100, 100, false) == JIANLU_DL_NEED);
     return 0;
 }

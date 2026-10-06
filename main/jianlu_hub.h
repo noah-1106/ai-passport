@@ -27,6 +27,7 @@ esp_err_t jianlu_hub_download_file(const char *api_path, const char *file_path);
 // 缓存文件存在且非空
 bool jianlu_hub_cache_exists(const char *file_path);
 
+
 // GET {hub}/api/records?status=pending&pageSize=20
 // 成功时把 records 填入 store 并返回 ESP_OK;失败返回错误并把可读说明写进
 // errbuf(可为 NULL)。无 PSRAM:响应收进定长静态缓冲,超长直接报错,

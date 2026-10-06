@@ -41,9 +41,10 @@ jianlu_nav_result_t jianlu_nav_key(jianlu_nav_t *nav, int btn, int ev);
 jianlu_page_t jianlu_nav_home_target(int focus);
 
 #define JIANLU_HOME_ITEMS     3
-#define JIANLU_SETTINGS_ITEMS 5
+#define JIANLU_SETTINGS_ITEMS 6
 #define JIANLU_SETTINGS_ROW_BRIGHTNESS 0   // 屏幕亮度(OK 循环调档)
-#define JIANLU_SETTINGS_ROW_KEEPON     1   // 屏幕常亮(OK 开关)
-#define JIANLU_SETTINGS_ROW_SYNC       2   // 立即同步
-#define JIANLU_SETTINGS_ROW_REPROV     3   // 重新配网
-#define JIANLU_SETTINGS_ROW_ABOUT      4   // 关于(最后一项)
+#define JIANLU_SETTINGS_ROW_THEME     1   // 色彩主题(OK 循环切换)
+#define JIANLU_SETTINGS_ROW_KEEPON    2   // 屏幕常亮(OK 开关)
+#define JIANLU_SETTINGS_ROW_SYNC      3   // 立即同步
+#define JIANLU_SETTINGS_ROW_REPROV    4   // 重新配网
+#define JIANLU_SETTINGS_ROW_ABOUT     5   // 关于(最后一项)

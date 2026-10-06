@@ -21,6 +21,7 @@
 #include "jianlu_home.h"
 #include "jianlu_json.h"
 #include "jianlu_store.h"
+#include "jianlu_theme.h"
 
 // 页面(v2 导航模型)
 typedef enum {
@@ -99,8 +100,16 @@ void jianlu_ui_home_set(const jianlu_profile_t *prof,
                         const jianlu_home_model_t *model, bool avatar_ok);
 void jianlu_ui_home_focus(int focus);   // 0 简录 1 二维码 2 设置
 
-// 二维码页:available=有缓存图可显示,否则显示引导文案
-void jianlu_ui_qr_set(bool available);
+// 二维码页(名片版式,无头像行):available=有缓存图可显示;
+// 无二维码时白卡内显示引导文案。
+void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof);
 
-// 设置页:焦点行 + 亮度百分比 + 常亮开关
-void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on);
+// 设置页:焦点行 + 亮度百分比 + 常亮开关 + 当前主题名
+void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
+                            int theme_id);
+
+// ---- 色彩主题 ----
+int jianlu_ui_theme(void);              // 当前主题 id
+uint32_t jianlu_ui_accent(void);        // 当前主题强调色(应用层覆盖层标题用)
+// 切换主题:换调色板 + 整屏重建;调用方随后 refresh 各页内容
+void jianlu_ui_set_theme(int id);

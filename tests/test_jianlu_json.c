@@ -138,6 +138,17 @@ static void test_parse_profile(void) {
     assert(jianlu_json_parse_profile(empty, sizeof(empty) - 1, &out) == 0);
     assert(out.nickname[0] == '\0');
     assert(!out.has_avatar);
+    assert(out.avatar_version == 0);   // 无版本字段按 0
+
+    // 版本号字段(mtime 毫秒,浮点)
+    static const char ver[] =
+        "{\"nickname\":\"N\",\"signature\":\"\",\"hasAvatar\":true,"
+        "\"hasQrcode\":true,\"avatarVersion\":1791292974659.5,"
+        "\"qrcodeVersion\":1791292974686.8}";
+    assert(jianlu_json_parse_profile(ver, sizeof(ver) - 1, &out) == 0);
+    assert(out.avatar_version == 1791292974659ULL);
+    assert(out.qrcode_version == 1791292974686ULL);
+    // 相同版本 → 调用方跳过下载(决策函数见 test_jianlu_config)
 
     static const char bad[] = "{\"nickname\":";
     assert(jianlu_json_parse_profile(bad, sizeof(bad) - 1, &out) == -1);

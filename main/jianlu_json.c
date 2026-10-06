@@ -122,6 +122,15 @@ static bool json_bool(const cJSON *obj, const char *key)
     return cJSON_IsBool(item) ? cJSON_IsTrue(item) : false;
 }
 
+// 数字字段 → u64(mtime 毫秒,cJSON 内部是 double,1.8e12 < 2^53 精确)
+static uint64_t json_u64(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsNumber(item) && item->valuedouble > 0
+               ? (uint64_t)item->valuedouble
+               : 0;
+}
+
 int jianlu_json_parse_profile(const char *body, size_t len, jianlu_profile_t *out)
 {
     if (body == NULL || out == NULL) return -1;
@@ -139,6 +148,8 @@ int jianlu_json_parse_profile(const char *body, size_t len, jianlu_profile_t *ou
                      json_string(root, "signature"), sizeof(out->signature) - 1);
     out->has_avatar = json_bool(root, "hasAvatar");
     out->has_qrcode = json_bool(root, "hasQrcode");
+    out->avatar_version = json_u64(root, "avatarVersion");
+    out->qrcode_version = json_u64(root, "qrcodeVersion");
 
     cJSON_Delete(root);
     return 0;

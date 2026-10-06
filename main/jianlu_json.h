@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "jianlu_store.h"
 
@@ -38,6 +39,8 @@ typedef struct {
     char signature[JIANLU_SIGNATURE_LEN];
     bool has_avatar;
     bool has_qrcode;
+    uint64_t avatar_version;   // 中枢 avatarVersion(mtime ms),无图=0
+    uint64_t qrcode_version;
 } jianlu_profile_t;
 
 // 解析 {"nickname":...,"signature":...,"hasAvatar":bool,"hasQrcode":bool}。

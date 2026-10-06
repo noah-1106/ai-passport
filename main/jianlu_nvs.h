@@ -22,6 +22,9 @@ typedef struct {
     char hub_url[JIANLU_HUB_URL_LEN];
     uint8_t brightness;      // 25/50/75/100;0=未设置
     uint8_t keep_on;         // 屏幕常亮 0/1
+    uint8_t theme;           // 色彩主题 0..3;0=墨夜(默认)
+    uint64_t avatar_ver;     // 已缓存头像的中枢版本(0=未缓存)
+    uint64_t qrcode_ver;
 } jianlu_nvs_data_t;
 
 // 读取全部已知 key 到 data(缺失的 key 置空串)。NVS 未初始化返回错误。
@@ -32,6 +35,9 @@ esp_err_t jianlu_nvs_save_wifi(const char *ssid, const char *pass);
 esp_err_t jianlu_nvs_save_hub(const char *url);
 esp_err_t jianlu_nvs_save_brightness(uint8_t pct);
 esp_err_t jianlu_nvs_save_keep_on(uint8_t on);
+esp_err_t jianlu_nvs_save_theme(uint8_t theme);
+// 图片缓存版本记录(下载成功后写新版本;失效时写 0)
+esp_err_t jianlu_nvs_save_image_ver(bool avatar, uint64_t ver);
 
 // 重配:擦除 wifi_ssid/wifi_pass/hub_url 三个 key(其余 NVS 内容不动)。
 esp_err_t jianlu_nvs_clear_provisioning(void);

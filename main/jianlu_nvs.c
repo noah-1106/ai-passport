@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "jianlu_theme.h"
 #include "nvs.h"
 
 static const char *TAG = "jianlu_nvs";
@@ -36,6 +37,12 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     uint8_t keepon = 0;
     nvs_get_u8(h, "keepon", &keepon);
     data->keep_on = keepon;
+    uint8_t theme = 0;
+    nvs_get_u8(h, "theme", &theme);
+    if (theme >= JIANLU_THEME_COUNT) theme = 0;   // 越界回默认
+    data->theme = theme;
+    nvs_get_u64(h, "av_ver", &data->avatar_ver);
+    nvs_get_u64(h, "qr_ver", &data->qrcode_ver);
     nvs_close(h);
     return ESP_OK;
 }
@@ -61,6 +68,22 @@ esp_err_t jianlu_nvs_save_brightness(uint8_t pct)
 esp_err_t jianlu_nvs_save_keep_on(uint8_t on)
 {
     return nvs_save_u8("keepon", on);
+}
+
+esp_err_t jianlu_nvs_save_theme(uint8_t theme)
+{
+    return nvs_save_u8("theme", theme);
+}
+
+esp_err_t jianlu_nvs_save_image_ver(bool avatar, uint64_t ver)
+{
+    nvs_handle_t h;
+    esp_err_t err = open(&h, NVS_READWRITE);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u64(h, avatar ? "av_ver" : "qr_ver", ver);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
 }
 
 static esp_err_t save_pair(const char *key1, const char *val1,

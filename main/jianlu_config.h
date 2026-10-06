@@ -6,6 +6,9 @@
 // Kconfig 全部留空即"出厂配网模式"。
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 typedef enum {
     JIANLU_WIFI_NONE = 0,
     JIANLU_WIFI_NVS,
@@ -25,3 +28,13 @@ jianlu_wifi_src_t jianlu_config_pick_wifi(const char *nvs_ssid, const char *kcon
 // 优先级:KCONFIG > MDNS > NVS > NONE。mdns_url 为本次发现结果(失败传 NULL)。
 jianlu_hub_src_t jianlu_config_pick_hub(const char *kconf_url, const char *mdns_url,
                                         const char *nvs_url);
+
+// ---- 图片缓存下载决策(头像/二维码共用,host 可测)----
+typedef enum {
+    JIANLU_DL_SKIP = 0,    // 版本未变且缓存存在:跳过下载
+    JIANLU_DL_NEED,        // 需要下载(版本变化或缓存缺失)
+    JIANLU_DL_INVALIDATE,  // 中枢已无此图:删缓存清版本
+} jianlu_dl_action_t;
+
+jianlu_dl_action_t jianlu_dl_decide(bool has, uint64_t version, uint64_t last_version,
+                                    bool cache_exists);

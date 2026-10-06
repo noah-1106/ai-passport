@@ -115,6 +115,10 @@ run_static_checks() {
         -o "${test_dir}/test_jianlu_nav"
     "${test_dir}/test_jianlu_nav"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_theme.c main/jianlu_theme.c \
+        -o "${test_dir}/test_jianlu_theme"
+    "${test_dir}/test_jianlu_theme"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_jianlu_home.c main/jianlu_home.c main/jianlu_store.c main/jianlu_timefmt.c \
         -o "${test_dir}/test_jianlu_home"
     "${test_dir}/test_jianlu_home"

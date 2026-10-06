@@ -9,6 +9,7 @@
 // 自定义解码器必须包含它;升级 LVGL 时需复核。
 #include "image/lv_image_decoder_private.h"
 #include "jianlu_glyph.h"
+#include "jianlu_theme.h"
 #include "jianlu_json.h"
 #include "jianlu_layout.h"
 #include "jianlu_pager.h"
@@ -18,19 +19,21 @@
 #include "esp_log.h"
 #include <sys/time.h>
 
-// ---- 配色:深色台账风,琥珀色为唯一强调色 ----
-#define UI_BG         0x10141A   // 屏幕底色(比最后的卡更深,衬出堆叠)
-#define UI_CARD_TOP   0x232C38   // 顶卡
-#define UI_CARD_MID   0x1B222C   // 第二层
-#define UI_CARD_BACK  0x151B23   // 第三层
-#define UI_CARD       0x1F2733   // 普通卡片(主页菜单格/设置行)
-#define UI_CARD_SEL   0x27313F   // 焦点/选中提亮
-#define UI_ACCENT     0xE8A33D   // 琥珀强调色(顶卡描边/待办徽标/录音点)
-#define UI_INK        0xF2EDE3   // 主文字
-#define UI_DIM        0x8A94A3   // 次要文字
-#define UI_BADGE_ART  0x5B9BD5   // 文章徽标
-#define UI_BADGE_INS  0x9B7EDE   // 灵感徽标
-#define UI_BADGE_OTH  0x6B7280   // 其他徽标
+// ---- 配色:运行时调色板(主题),宏重定向到当前主题,调用点零改动 ----
+// 切换主题 = 换指针 + 整屏重建(jianlu_ui_set_theme),允许短暂重绘。
+static const jianlu_theme_t *s_theme;   // jianlu_ui_create/set_theme 时设置
+#define UI_BG         (s_theme->bg)
+#define UI_CARD_TOP   (s_theme->card_top)
+#define UI_CARD_MID   (s_theme->card_mid)
+#define UI_CARD_BACK  (s_theme->card_back)
+#define UI_CARD       (s_theme->card)
+#define UI_CARD_SEL   (s_theme->card_sel)
+#define UI_ACCENT     (s_theme->accent)
+#define UI_INK        (s_theme->ink)
+#define UI_DIM        (s_theme->dim)
+#define UI_BADGE_ART  (s_theme->badge_art)
+#define UI_BADGE_INS  (s_theme->badge_ins)
+#define UI_BADGE_OTH  (s_theme->badge_oth)
 
 // ---- 堆叠几何:三张卡依次偏移 10px、缩窄 8px,顶卡全显,后卡露头 ----
 #define DECK_TOP_X    16
@@ -45,11 +48,13 @@
 // 回退 Montserrat 14 补拉丁/数字。生成命令见 assets/fonts/README.md。
 LV_FONT_DECLARE(jianlu_font_16);
 static lv_font_t s_font_cjk;
+static int s_theme_id;   // 当前主题(= s_theme 在调色板表中的下标)
+static lv_obj_t *s_scr;  // 当前屏幕(主题切换时整屏重建)
 
 static lv_obj_t *s_slots[3];          // 0=顶 1=中 2=底(创建顺序即 z 序)
 static lv_obj_t *s_badge;
 static lv_obj_t *s_badge_text;
-static lv_obj_t *s_title;
+static lv_obj_t *s_card_title;
 static lv_obj_t *s_summary;
 static lv_obj_t *s_tags;
 static lv_obj_t *s_date;
@@ -248,9 +253,9 @@ static void deck_build(lv_obj_t *scr)
     jianlu_deck_layout_t dl;
     jianlu_deck_layout(lv_font_get_line_height(&s_font_cjk), &dl);
 
-    s_title = text_create(top, 40, dl.title_y, 158, UI_INK);
-    lv_obj_set_height(s_title, dl.title_h);
-    lv_label_set_long_mode(s_title, LV_LABEL_LONG_DOT);   // 折行+末行省略号
+    s_card_title = text_create(top, 40, dl.title_y, 158, UI_INK);
+    lv_obj_set_height(s_card_title, dl.title_h);
+    lv_label_set_long_mode(s_card_title, LV_LABEL_LONG_DOT);   // 折行+末行省略号
 
     s_summary = text_create(top, 12, dl.summary_y, 184, UI_DIM);
     lv_obj_set_height(s_summary, dl.summary_h);
@@ -295,10 +300,10 @@ static void deck_apply(const jianlu_store_t *store)
     static char summary[JIANLU_SUMMARY_LEN];
     sanitize_text(title, sizeof(title), rec->title);
     sanitize_text(summary, sizeof(summary), rec->summary);
-    lv_label_set_text(s_title, title);
-    lv_obj_set_style_text_decor(s_title,
+    lv_label_set_text(s_card_title, title);
+    lv_obj_set_style_text_decor(s_card_title,
         pending ? LV_TEXT_DECOR_STRIKETHROUGH : LV_TEXT_DECOR_NONE, 0);
-    lv_obj_set_style_text_color(s_title,
+    lv_obj_set_style_text_color(s_card_title,
         lv_color_hex(pending ? UI_DIM : UI_INK), 0);
 
     char tags[2 * JIANLU_TAG_LEN + 8];
@@ -939,7 +944,8 @@ static void raw565_register(void)
 // ---------------------------------------------------------------------------
 // 页面:主页 / 二维码 / 设置(简录页 = 卡片堆,保持原有结构)
 // ---------------------------------------------------------------------------
-static lv_obj_t *s_title;      // 顶栏标题/主页时间
+static lv_obj_t *s_title;      // 顶栏页面标题
+static lv_obj_t *s_time;       // 主页顶栏时间(标题右侧)
 static lv_obj_t *s_hint;       // 简录页底栏按键提示
 static lv_obj_t *s_home_panel;
 static lv_obj_t *s_qr_panel;
@@ -959,13 +965,15 @@ static lv_obj_t *s_home_cells[3];
 // 二维码页部件
 static lv_obj_t *s_qr_img;
 static lv_obj_t *s_qr_hint;
+static lv_obj_t *s_qr_guide;
+static lv_obj_t *s_qr_nick;
 // 设置页部件
-#define SETTINGS_ROWS 5
+#define SETTINGS_ROWS 6
 static lv_obj_t *s_set_rows[SETTINGS_ROWS];
 static lv_obj_t *s_set_vals[SETTINGS_ROWS];
 
 static const char *const SETTING_NAMES[SETTINGS_ROWS] = {
-    "屏幕亮度", "屏幕常亮", "立即同步", "重新配网", "关于",
+    "屏幕亮度", "色彩主题", "屏幕常亮", "立即同步", "重新配网", "关于",
 };
 
 static void home_build(lv_obj_t *scr)
@@ -1024,19 +1032,44 @@ static void home_build(lv_obj_t *scr)
     }
 }
 
+// 名片版二维码页(参照微信二维码名片):
+// 深色背景上一张白色圆角卡片,内含 头像+昵称 / 二维码 / 引导文案。
 static void qr_build(lv_obj_t *scr)
 {
     s_qr_panel = panel_create(scr, 0, 44, 240, 276, UI_BG, 0);
     lv_obj_set_style_border_width(s_qr_panel, 0, 0);
 
-    lv_obj_t *frame = panel_create(s_qr_panel, 32, 12, 176, 176, 0xFFFFFF, 4);
-    lv_obj_set_style_clip_corner(frame, true, 0);
-    s_qr_img = lv_image_create(frame);
-    lv_obj_center(s_qr_img);
+    // 白色名片卡(轻投影增强层次)
+    lv_obj_t *card = panel_create(s_qr_panel, 24, 4, 192, 264, 0xFFFFFF, 16);
+    if (jianlu_theme_is_light(s_theme_id)) {   // 浅色主题:白卡加描边保层次
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(UI_DIM), 0);
+    }
+    lv_obj_set_style_shadow_width(card, 12, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_30, 0);
+    lv_obj_set_style_shadow_offset_y(card, 3, 0);
 
-    s_qr_hint = text_create(s_qr_panel, 20, 200, 200, UI_DIM);
+    // 昵称居中(16px + 字距撑出存在感,不另生成字号)
+    s_qr_nick = text_create(card, 8, 26, 176, 0x1A222E);
+    lv_obj_set_style_text_align(s_qr_nick, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(s_qr_nick, 2, 0);
+    lv_label_set_long_mode(s_qr_nick, LV_LABEL_LONG_DOT);
+
+    // 二维码:176 原尺寸居中(白卡即白边)
+    s_qr_img = lv_image_create(card);
+    lv_obj_set_pos(s_qr_img, 8, 60);
+
+    // 底部引导(白底上的灰字)
+    s_qr_hint = text_create(card, 0, 246, 192, 0x8A94A3);
     lv_obj_set_style_text_align(s_qr_hint, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(s_qr_hint, "扫一扫加微信");
+
+    // 无二维码时的引导文案(白卡内居中,占二维码位)
+    s_qr_guide = text_create(card, 16, 120, 160, 0x8A94A3);
+    lv_obj_set_style_text_align(s_qr_guide, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_qr_guide, "在中枢 Web 端\n上传你的微信二维码");
+    lv_obj_add_flag(s_qr_guide, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void settings_build(lv_obj_t *scr)
@@ -1060,15 +1093,21 @@ static void settings_build(lv_obj_t *scr)
 void jianlu_ui_show_page(jianlu_ui_page_t page)
 {
     s_page = page;
+    // 标题随页面:主页「我的工牌」+时间并列;子页各自标题
     if (page == JIANLU_UI_HOME) {
-        lv_label_set_text(s_title, s_time_text);
-    } else if (page == JIANLU_UI_JIANLU) {
-        lv_label_set_text(s_title, "小诺简录");
-    } else if (page == JIANLU_UI_QR) {
-        lv_label_set_text(s_title, "二维码");
+        lv_label_set_text(s_title, s_time_text);   // 主页左侧只显示时间
+        lv_obj_add_flag(s_time, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_label_set_text(s_title, "设置");
+        lv_obj_add_flag(s_time, LV_OBJ_FLAG_HIDDEN);
+        if (page == JIANLU_UI_JIANLU) {
+            lv_label_set_text(s_title, "简录");
+        } else if (page == JIANLU_UI_QR) {
+            lv_label_set_text(s_title, "我的二维码");
+        } else {
+            lv_label_set_text(s_title, "设置");
+        }
     }
+    lv_obj_remove_flag(s_title, LV_OBJ_FLAG_HIDDEN);
     // 主页显隐由 refresh 按 view 决定(非 READY 时让位给状态层);
     // 二维码/设置页随选择显示
     page == JIANLU_UI_QR ? lv_obj_remove_flag(s_qr_panel, LV_OBJ_FLAG_HIDDEN)
@@ -1149,19 +1188,29 @@ void jianlu_ui_home_focus(int focus)
     }
 }
 
-void jianlu_ui_qr_set(bool available)
+void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof)
 {
+    // 昵称(无头像行的简洁版式)
+    static char nick[JIANLU_NICKNAME_LEN];
+    sanitize_text(nick, sizeof(nick), prof ? prof->nickname : NULL);
+    if (nick[0] == '\0') snprintf(nick, sizeof(nick), "小诺");
+    lv_label_set_text(s_qr_nick, nick);
+    ESP_LOGD("jianlu_ui", "qr_set: available=%d", (int)available);
+
     if (available) {
         lv_image_set_src(s_qr_img, "P:/voicefs/qrcode.raw");
         lv_obj_remove_flag(s_qr_img, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_qr_hint, "扫一扫加微信");
+        lv_obj_add_flag(s_qr_guide, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_qr_hint, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_qr_img, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_qr_hint, "在中枢 Web 端\n上传你的微信二维码");
+        lv_obj_remove_flag(s_qr_guide, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_qr_hint, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on)
+void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
+                            int theme_id)
 {
     for (int i = 0; i < SETTINGS_ROWS; i++) {
         lv_obj_set_style_border_width(s_set_rows[i], i == focus ? 2 : 0, 0);
@@ -1170,7 +1219,8 @@ void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on)
             lv_color_hex(i == focus ? UI_CARD_SEL : UI_CARD), 0);
     }
     lv_label_set_text_fmt(s_set_vals[0], "%d%%", brightness_pct);
-    lv_label_set_text(s_set_vals[1], keep_on ? "开" : "关");
+    lv_label_set_text(s_set_vals[1], jianlu_theme_name(theme_id));
+    lv_label_set_text(s_set_vals[2], keep_on ? "开" : "关");
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,16 +1292,14 @@ static void battery_tick(lv_timer_t *timer)
             jianlu_time_format_mmdd_hhmm(epoch, full, sizeof(full));
             jianlu_utf8_copy(s_time_text, sizeof(s_time_text), full + 6,
                              sizeof(s_time_text) - 1);
-            lv_label_set_text(s_title, s_time_text);
+            lv_label_set_text(s_time, s_time_text);
         }
     }
 }
 
-void jianlu_ui_create(void)
+// 全部页面/覆盖层对象都在 s_scr 上创建;定时器只建一次(归 create 管)
+static void ui_build_all(void)
 {
-    fonts_init();
-    raw565_register();
-
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(UI_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -1259,8 +1307,14 @@ void jianlu_ui_create(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_title = text_create(scr, 20, 13, 140, UI_INK);
-    lv_label_set_text(s_title, "小诺简录");
+    s_title = text_create(scr, 20, 13, 200, UI_INK);
+    lv_label_set_text(s_title, "我的工牌");
+    lv_obj_add_flag(s_title, LV_OBJ_FLAG_HIDDEN);   // 主页默认藏,见 show_page
+
+    // 主页顶栏时间(标题右侧,仅主页可见)
+    s_time = text_create(scr, 96, 13, 44, UI_INK);
+    lv_label_set_text(s_time, "--:--");
+    lv_obj_add_flag(s_time, LV_OBJ_FLAG_HIDDEN);
 
     s_battery = lv_label_create(scr);
     lv_obj_set_pos(s_battery, 182, 15);
@@ -1275,14 +1329,14 @@ void jianlu_ui_create(void)
     lv_label_set_text(s_offline, "离线");
     lv_obj_add_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *divider = panel_create(scr, 20, 38, 200, 1, 0x2A3442, 0);
+    lv_obj_t *divider = panel_create(scr, 20, 38, 200, 1, s_theme->card_back, 0);
+    (void)divider;
 
     deck_build(scr);
 
     s_status = text_create(scr, 24, 130, 192, UI_DIM);
     lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(s_status, "");
-    (void)divider;
 
     s_hint = text_create(scr, 10, 296, 220, UI_DIM);
     lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
@@ -1296,15 +1350,46 @@ void jianlu_ui_create(void)
     about_build(s_voice_panel);
     flash_build(scr);
 
+    // 先加载新屏再删旧屏(LVGL 安全顺序);旧屏上的动画随对象一并清除
+    lv_obj_t *old = s_scr;
+    s_scr = scr;
+    jianlu_ui_show_page(s_page);   // 恢复当前页(标题/各面板显隐)
+    lv_screen_load(scr);
+    if (old != NULL) lv_obj_delete(old);
+    battery_tick(NULL);
+}
+
+int jianlu_ui_theme(void)
+{
+    return s_theme_id;
+}
+
+uint32_t jianlu_ui_accent(void)
+{
+    return s_theme->accent;
+}
+
+// 切换主题:换调色板 + 整屏重建(允许短暂重绘;内容由调用方 refresh 恢复)
+void jianlu_ui_set_theme(int id)
+{
+    s_theme_id = id;
+    s_theme = jianlu_theme_get(id);
+    s_avatar_dirty = true;   // 头像 src 指向新对象,需重设
+    s_anim_running = false;
+    s_wave_active = false;
+    ui_build_all();
+}
+
+void jianlu_ui_create(void)
+{
+    fonts_init();
+    raw565_register();
+    s_theme = jianlu_theme_get(s_theme_id);
+    ui_build_all();
+
+    // 定时器与屏幕无关(读静态对象指针),只建一次
     lv_timer_create(wave_tick, 100, NULL);
     lv_timer_create(battery_tick, 10000, NULL);
-    battery_tick(NULL);
-
-    // v2:默认主页;启动阶段(非 READY)由状态层覆盖显示
-    jianlu_ui_show_page(JIANLU_UI_HOME);
-    lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);   // 主页无底栏提示
-
-    lv_screen_load(scr);
 }
 
 void jianlu_ui_refresh(const jianlu_store_t *store, jianlu_anim_t anim)
