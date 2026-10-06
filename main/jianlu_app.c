@@ -44,6 +44,7 @@
 #include "jianlu_offline.h"
 #include "jianlu_powersave.h"
 #include "jianlu_provision.h"
+#include "jianlu_shot.h"
 #include "jianlu_theme.h"
 #include "jianlu_timefmt.h"
 #include "jianlu_tone.h"
@@ -168,8 +169,32 @@ static esp_timer_handle_t s_confirm_timer;
 // 导航自检脚本:{btn, ev},每 1.2s 注入一个
 typedef struct { bsp_btn_t btn; bsp_btn_ev_t ev; } nav_test_key_t;
 static const nav_test_key_t NAV_TEST_SCRIPT[] = {
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点 →二维码
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进二维码页(诊断 avatar_ok)
+    // 主题回墨夜 + 进入二维码页
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 0 焦点1
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 1 焦点2
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 2 进设置
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 3 主题行
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 4 切主题
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 5 切主题
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 6 切到墨夜
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 7 回主页
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 8 焦点1
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 9 进二维码页
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 10 QR页无操作(窗口)
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 11 无操作           ← 截 qr
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 12 回主页
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 13 主页焦点(页面不变)← 截 home
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 14 焦点回到1
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 15 焦点2
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 16 进设置
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 17 设置行焦点(页面不变)← 截 settings
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 18 行焦点
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 19 回主页
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 20 焦点0(简录)
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 21 进简录
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 22 翻卡(页面不变)  ← 截 jianlu
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 23 翻卡
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 24 回主页
 };
 #define NAV_TEST_STEPS (sizeof(NAV_TEST_SCRIPT) / sizeof(NAV_TEST_SCRIPT[0]))
 static esp_timer_handle_t s_nav_test_timer;
@@ -204,7 +229,7 @@ static void nav_test_start(void)
         .name = "nav_test",
     };
     if (esp_timer_create(&args, &s_nav_test_timer) == ESP_OK) {
-        esp_timer_start_periodic(s_nav_test_timer, 1200ULL * 1000);
+        esp_timer_start_periodic(s_nav_test_timer, 15000ULL * 1000);
     }
 }
 #endif
@@ -723,8 +748,8 @@ static bool ensure_worker_tasks(void)
     s_job_queue = xQueueCreate(JOB_QUEUE_DEPTH, sizeof(net_job_t));
     s_rec_queue = xQueueCreate(1, sizeof(rec_cmd_type_t));
     if (!s_job_queue || !s_rec_queue) return false;
-    if (xTaskCreate(net_task, "jianlu_net", 6144, NULL, 4, NULL) != pdPASS ||
-        xTaskCreate(rec_task, "jianlu_rec", 4096, NULL, 6, NULL) != pdPASS) {
+    if (xTaskCreate(net_task, "jianlu_net", 5120, NULL, 4, NULL) != pdPASS ||
+        xTaskCreate(rec_task, "jianlu_rec", 3072, NULL, 6, NULL) != pdPASS) {
         ESP_LOGE(TAG, "网络/录音任务创建失败");
         return false;
     }
@@ -915,10 +940,12 @@ static void on_got_ip(void)
     stop_provisioning();
     jianlu_netflow_event(&s_nf, JIANLU_NF_GOT_IP);
     apply_view(JIANLU_ANIM_NONE);
+    ESP_LOGI(TAG, "堆: got_ip 时 %u", (unsigned)esp_get_free_heap_size());
     // 趁堆宽裕先把音频 I2S DMA 拿下(首次录音再分配可能失败)
     if (jianlu_capture_prepare_audio() != ESP_OK) {
         ESP_LOGW(TAG, "音频初始化失败,语音记录将不可用");
     }
+    ESP_LOGI(TAG, "堆: 音频后 %u", (unsigned)esp_get_free_heap_size());
     if (!ensure_worker_tasks()) {
         set_error("系统资源不足");
         return;
@@ -1615,6 +1642,8 @@ void jianlu_app_start(void)
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
         enter_provisioning();
     }
+
+    jianlu_shot_start();   // 串口截屏服务(只读,失败不影响应用)
 
     esp_err_t btn_err = bsp_button_init(on_key, NULL);
     if (btn_err != ESP_OK) {

@@ -26,6 +26,7 @@ idf_component_register(
          "jianlu_timefmt.c"
          "jianlu_modal.c"
          "jianlu_theme.c"
+         "jianlu_shot.c"
          "jianlu_nav.c"
          "jianlu_home.c"
          "../assets/fonts/jianlu_font_16.c"

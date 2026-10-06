@@ -127,7 +127,7 @@ void jianlu_tone_play(jianlu_tone_t tone)
         s_queue = xQueueCreate(2, sizeof(jianlu_tone_t));
         if (!s_queue) return;
         sine_ensure();
-        if (xTaskCreate(tone_task, "jianlu_tone", 3072, NULL, 3, NULL) != pdPASS) {
+        if (xTaskCreate(tone_task, "jianlu_tone", 2048, NULL, 3, NULL) != pdPASS) {
             vQueueDelete(s_queue);
             s_queue = NULL;
             return;

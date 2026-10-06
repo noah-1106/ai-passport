@@ -63,10 +63,11 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2920
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=40
 # TWDT 超时触发 panic 复位(自愈),不只是打印警告。
 CONFIG_ESP_TASK_WDT_PANIC=y
-# lwip pbuf 池 16→10(TCP 窗口已减半,10 个在飞足够)。
-CONFIG_LWIP_PBUF_POOL_SIZE=10
 # Wi-Fi 静态接收缓冲 10→8,动态缓冲兜底。
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+# AMPDU RX 聚合窗保持默认 6:实测压到 2 省不了多少堆(底仍 ~11K),
+# 却勒死聚合吞吐(96KB 语音上传 ESP_ERR_HTTP_CONNECT 超时)。
+# CONFIG_ESP_WIFI_RX_BA_WIN=6
 
 # 「关于」页:本地 lv_qrcode 生成作者主页二维码。
 CONFIG_LV_USE_QRCODE=y
