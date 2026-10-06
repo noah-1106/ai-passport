@@ -20,6 +20,7 @@ typedef struct {
     char wifi_ssid[JIANLU_NVS_SSID_LEN];
     char wifi_pass[JIANLU_NVS_PASS_LEN];
     char hub_url[JIANLU_HUB_URL_LEN];
+    uint8_t brightness;      // 25/50/75/100;0=未设置
 } jianlu_nvs_data_t;
 
 // 读取全部已知 key 到 data(缺失的 key 置空串)。NVS 未初始化返回错误。
@@ -28,6 +29,7 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data);
 // 单项写入(立即提交)。len 超限返回 ESP_ERR_INVALID_ARG,不截断写坏数据。
 esp_err_t jianlu_nvs_save_wifi(const char *ssid, const char *pass);
 esp_err_t jianlu_nvs_save_hub(const char *url);
+esp_err_t jianlu_nvs_save_brightness(uint8_t pct);
 
 // 重配:擦除 wifi_ssid/wifi_pass/hub_url 三个 key(其余 NVS 内容不动)。
 esp_err_t jianlu_nvs_clear_provisioning(void);

@@ -13,10 +13,12 @@
 #include "jianlu_app.h"
 
 #include <string.h>
+#include <sys/time.h>
 
 #include "bsp_button.h"
 #include "bsp_display.h"
 #include "driver/gpio.h"
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -32,9 +34,11 @@
 #include "jianlu_capture.h"
 #include "jianlu_config.h"
 #include "jianlu_discover.h"
+#include "jianlu_home.h"
 #include "jianlu_hub.h"
 #include "jianlu_level.h"
 #include "jianlu_modal.h"
+#include "jianlu_nav.h"
 #include "jianlu_netflow.h"
 #include "jianlu_nvs.h"
 #include "jianlu_offline.h"
@@ -50,6 +54,9 @@ static const char *TAG = "jianlu";
 // 临时链路自检:置 1 后,Wi-Fi 连通即自动录 3s 并上传(不等按键),
 // 用于无人值守验证 录音→上传→中枢→解析 链路。验证完必须改回 0。
 #define VOICE_LINK_SELFTEST 0
+// 临时导航自检:置 1 后,首次拉取成功后按脚本注入按键事件,覆盖
+// 主页菜单/三子页/亮度/双击返回/全局按住说话/简录页翻卡。验证完必须改回 0。
+#define NAV_LINK_SELFTEST 0
 
 #define EVENT_QUEUE_DEPTH 16
 #define JOB_QUEUE_DEPTH   4
@@ -74,6 +81,9 @@ typedef enum {
     EV_SYNC_DONE,        // 网络任务:待同步回放结束(arg1=esp_err,arg2=剩余条数)
     EV_OFFLINE_RETRY,    // 离线模式定时重试拉取
     EV_CONFIRM_TIMEOUT,  // 语音确认页自动关闭
+    EV_PROFILE_DONE,     // 网络任务:资料拉取(arg1=esp_err)
+    EV_AVATAR_DONE,      // 网络任务:头像下载(arg1=esp_err)
+    EV_QR_DONE,          // 网络任务:二维码下载(arg1=esp_err)
 } app_ev_type_t;
 
 typedef struct {
@@ -91,6 +101,9 @@ typedef enum {
     JOB_CAPTURE,         // 语音队列:上传队头一条
     JOB_DISCOVER,        // mDNS 找中枢
     JOB_SYNC,            // 离线待同步队列回放
+    JOB_PROFILE,         // 拉资料(昵称/签名/有无图)
+    JOB_AVATAR,          // 下载头像缓存
+    JOB_QRCODE,          // 下载二维码缓存
 } job_type_t;
 
 typedef struct {
@@ -126,15 +139,87 @@ static int s_drain_done;         // 已处理条数
 static int s_drain_new_cards;    // 累计新增卡片数
 static int s_drain_syncq_total;  // 开始时离线勾选数
 static int s_drain_syncq_done;   // 已同步勾选项数
+// v2:导航与资料
+static jianlu_nav_t s_nav;
+static jianlu_profile_t s_profile;      // 应用任务所有
+static jianlu_profile_t s_profile_tmp;  // 网络任务写,EV_PROFILE_DONE 时提交
+static int s_brightness = 100;          // 25/50/75/100
+static bool s_info_shown;               // 「关于」信息页显示中
+
+#define AVATAR_PATH "/voicefs/avatar.raw"
+#define QRCODE_PATH "/voicefs/qrcode.raw"
 static bool s_prov_running;
 static bool s_reprov_confirm;        // 重配确认页显示中
 static bool s_screen_off;            // 背光已熄(省电)
 static QueueHandle_t s_ev_queue;
 static QueueHandle_t s_job_queue;
 static QueueHandle_t s_rec_queue;
+
+// 前向声明(定义在下方)
+static void reprov_overlay_show(void);
+static void drain_start(void);
 static esp_timer_handle_t s_retry_timer;
 static esp_timer_handle_t s_offline_timer;
 static esp_timer_handle_t s_confirm_timer;
+
+#if NAV_LINK_SELFTEST
+// 导航自检脚本:{btn, ev},每 1.2s 注入一个
+typedef struct { bsp_btn_t btn; bsp_btn_ev_t ev; } nav_test_key_t;
+static const nav_test_key_t NAV_TEST_SCRIPT[] = {
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 主页焦点 0→1
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点 1→2(设置)
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进设置
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 亮度循环
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 亮度再循环
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 设置焦点 →1(立即同步)
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进二维码(焦点 1... 等 focus)
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 主页焦点回退
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 到焦点 0(简录)
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进简录(自动 fresh)
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 翻卡
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
+    { BSP_BTN_OK,   BSP_BTN_LONG },   // 全局按住说话(设置页无关,验证可达性)
+    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 收尾(无操作)
+};
+#define NAV_TEST_STEPS (sizeof(NAV_TEST_SCRIPT) / sizeof(NAV_TEST_SCRIPT[0]))
+static esp_timer_handle_t s_nav_test_timer;
+static int s_nav_test_step;
+
+static void nav_test_tick(void *arg)
+{
+    (void)arg;
+    if (s_nav_test_step >= (int)NAV_TEST_STEPS) {
+        if (s_nav_test_timer) {
+            esp_timer_stop(s_nav_test_timer);
+            esp_timer_delete(s_nav_test_timer);
+            s_nav_test_timer = NULL;
+        }
+        ESP_LOGI(TAG, "[NAVTEST] 脚本完成");
+        return;
+    }
+    const nav_test_key_t *k = &NAV_TEST_SCRIPT[s_nav_test_step];
+    ESP_LOGI(TAG, "[NAVTEST] step %d: btn=%d ev=%d", s_nav_test_step,
+             (int)k->btn, (int)k->ev);
+    s_nav_test_step++;
+    if (!s_ev_queue) return;
+    app_ev_t msg = { .type = EV_KEY, .btn = k->btn, .btn_ev = k->ev };
+    (void)xQueueSend(s_ev_queue, &msg, 0);
+}
+
+static void nav_test_start(void)
+{
+    ESP_LOGI(TAG, "[NAVTEST] 开始脚本化按键注入");
+    esp_timer_create_args_t args = {
+        .callback = nav_test_tick,
+        .name = "nav_test",
+    };
+    if (esp_timer_create(&args, &s_nav_test_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_nav_test_timer, 1200ULL * 1000);
+    }
+}
+#endif
 static volatile bool s_wifi_connected;
 static volatile bool s_playing;      // 本地回放中
 static volatile bool s_play_stop;    // 任意键请求停止回放
@@ -358,6 +443,17 @@ static void net_task(void *arg)
             esp_err_t err = jianlu_offline_save_syncq(&q);
             ESP_LOGI(TAG, "待同步回放: %d 条剩 %d 条", total, q.count);
             post_event(EV_SYNC_DONE, (int32_t)err, q.count, NULL);
+        } else if (job.type == JOB_PROFILE) {
+            esp_err_t err = jianlu_hub_fetch_profile(&s_profile_tmp);
+            post_event(EV_PROFILE_DONE, (int32_t)err, 0, NULL);
+        } else if (job.type == JOB_AVATAR) {
+            esp_err_t err = jianlu_hub_download_file("/api/profile/avatar.raw",
+                                                     AVATAR_PATH);
+            post_event(EV_AVATAR_DONE, (int32_t)err, 0, NULL);
+        } else if (job.type == JOB_QRCODE) {
+            esp_err_t err = jianlu_hub_download_file("/api/profile/qrcode.raw",
+                                                     QRCODE_PATH);
+            post_event(EV_QR_DONE, (int32_t)err, 0, NULL);
         } else {
             // 语音队列:只打头(FIFO);队列循环由应用任务按结果驱动
             esp_err_t err = jianlu_capture_upload_head(&s_capture_result);
@@ -418,6 +514,142 @@ static void request_discover(void)
     if (!s_job_queue) return;
     net_job_t job = { .type = JOB_DISCOVER };
     (void)xQueueSend(s_job_queue, &job, 0);
+}
+
+static void request_job(job_type_t type)
+{
+    if (!s_job_queue) return;
+    net_job_t job = { .type = type };
+    (void)xQueueSend(s_job_queue, &job, 0);
+}
+
+// 主页内容装配并刷新(资料 + 清单 + 待同步数 + 时间 + 头像缓存状态)
+static void refresh_home(void)
+{
+    jianlu_home_model_t model;
+    jianlu_home_build(&s_store,
+                      jianlu_capture_queue_count() + s_syncq.count,
+                      (uint32_t)time(NULL), &model);
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_home_set(&s_profile, &model,
+                           jianlu_hub_cache_exists(AVATAR_PATH));
+        bsp_lvgl_unlock();
+    }
+}
+
+// 页面切换(v2 导航):进简录自动拉取(fresh);进二维码有网即刷新缓存
+static void switch_page(void)
+{
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_show_page((jianlu_ui_page_t)s_nav.page);
+        bsp_lvgl_unlock();
+    }
+    switch (s_nav.page) {
+    case JIANLU_PAGE_JIANLU:
+        if (s_wifi_connected && jianlu_hub_base()[0] != '\0' && !s_fetch_busy) {
+            s_nf = JIANLU_NF_LOADING;
+            apply_view(JIANLU_ANIM_NONE);
+            request_fetch();
+        }
+        break;
+    case JIANLU_PAGE_QR:
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_qr_set(jianlu_hub_cache_exists(QRCODE_PATH));
+            bsp_lvgl_unlock();
+        }
+        if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+            request_job(JOB_QRCODE);   // 有网按需刷新,失败用缓存
+        }
+        break;
+    case JIANLU_PAGE_SETTINGS:
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
+            bsp_lvgl_unlock();
+        }
+        break;
+    default:   // 主页
+        refresh_home();
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_home_focus(s_nav.home_focus);
+            bsp_lvgl_unlock();
+        }
+        break;
+    }
+    ui_refresh(JIANLU_ANIM_NONE);
+}
+
+// 亮度档:25/50/75/100 循环
+static const int BRIGHTNESS_LEVELS[] = { 25, 50, 75, 100 };
+#define BRIGHTNESS_LEVELS_N 4
+
+static void brightness_apply(int pct)
+{
+    s_brightness = pct;
+    bsp_display_backlight((uint8_t)pct);
+    jianlu_nvs_save_brightness((uint8_t)pct);
+    if (s_nav.page == JIANLU_PAGE_SETTINGS && bsp_lvgl_lock(500)) {
+        jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
+        bsp_lvgl_unlock();
+    }
+}
+
+static void brightness_adjust(int dir)
+{
+    int idx = 0;
+    for (int i = 0; i < BRIGHTNESS_LEVELS_N; i++) {
+        if (BRIGHTNESS_LEVELS[i] >= s_brightness) { idx = i; break; }
+        idx = i;
+    }
+    idx = (idx + dir + BRIGHTNESS_LEVELS_N) % BRIGHTNESS_LEVELS_N;
+    brightness_apply(BRIGHTNESS_LEVELS[idx]);
+    ESP_LOGI(TAG, "亮度 %d%%", s_brightness);
+}
+
+static void show_about(void)
+{
+    char sha[32];
+    char ver[64];
+    esp_err_t err = esp_app_get_elf_sha256(sha, sizeof(sha));
+    if (err == ESP_OK) {
+        snprintf(ver, sizeof(ver), "小诺简录\n固件 %02x%02x%02x%02x\nESP-IDF 5.5.3",
+                 sha[0], sha[1], sha[2], sha[3]);
+    } else {
+        snprintf(ver, sizeof(ver), "小诺简录\nESP-IDF 5.5.3");
+    }
+    s_info_shown = true;
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_overlay("关于", 0xE8A33D, ver, "OK 返回");
+        bsp_lvgl_unlock();
+    }
+}
+
+static void settings_action(void)
+{
+    switch (s_nav.settings_focus) {
+    case JIANLU_SETTINGS_ROW_BRIGHTNESS:
+        brightness_adjust(1);   // OK 也循环升档
+        break;
+    case JIANLU_SETTINGS_ROW_SYNC:
+        if (jianlu_capture_queue_count() + s_syncq.count > 0) {
+            ESP_LOGI(TAG, "设置页触发立即同步");
+            drain_start();
+        } else {
+            if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+                request_fetch();
+            }
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay_flash("已是最新", 0xE8A33D, "没有待同步内容");
+                bsp_lvgl_unlock();
+            }
+        }
+        break;
+    case JIANLU_SETTINGS_ROW_ABOUT:
+        show_about();
+        break;
+    case JIANLU_SETTINGS_ROW_REPROV:
+        reprov_overlay_show();
+        break;
+    }
 }
 
 // 网络/录音任务延迟到联网后再创建:配网期 Wi-Fi(67KB)与 NimBLE(~40KB)
@@ -494,6 +726,7 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
         ESP_LOGI(TAG, "发现 %d 条离线内容,等待用户确认同步", pending);
     }
     request_fetch();   // 清单照常拉取(提示页覆盖其上)
+    request_job(JOB_PROFILE);   // 资料(昵称/签名/头像/二维码清单)
 }
 
 // OK 确认开始补传:先语音队列(逐条进度),再离线勾选,最后汇总
@@ -754,10 +987,11 @@ static void on_key_event(const app_ev_t *ev)
     }
     // 补传进行中:屏蔽按键(进度/汇总由补传流程驱动)
     if (s_drain_active) return;
-    // 汇总/中断页 + 「发现离线内容」提示:模态按键路由表(jianlu_modal)
+    // 汇总/中断页 + 「发现离线内容」提示 + 「关于」:模态按键路由表(jianlu_modal)
     {
         jianlu_modal_t modal = s_sync_prompt ? JIANLU_MODAL_SYNC_PROMPT
                              : s_summary_shown ? JIANLU_MODAL_SUMMARY
+                             : s_info_shown ? JIANLU_MODAL_INFO
                              : JIANLU_MODAL_NONE;
         jianlu_modal_act_t act = jianlu_modal_key(modal, (int)ev->btn,
                                                   (int)ev->btn_ev);
@@ -782,6 +1016,7 @@ static void on_key_event(const app_ev_t *ev)
                 return;
             case JIANLU_MODAL_DISMISS:
                 s_summary_shown = false;
+                s_info_shown = false;
                 if (bsp_lvgl_lock(500)) {
                     jianlu_ui_overlay_hide();
                     bsp_lvgl_unlock();
@@ -849,19 +1084,31 @@ static void on_key_event(const app_ev_t *ev)
         }
         return;
     }
-    if (ev->btn == BSP_BTN_OK && ev->btn_ev == BSP_BTN_DOUBLE) {
-        // 双击刷新
-        if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
-            s_nf = JIANLU_NF_LOADING;
-            apply_view(JIANLU_ANIM_NONE);
-            request_fetch();
-        } else if (s_nf != JIANLU_NF_PROVISIONING) {
-            s_nf = JIANLU_NF_CONNECTING;
-            apply_view(JIANLU_ANIM_NONE);
-            wifi_connect();
+    // 页面导航(纯路由表 jianlu_nav):简录页之外全部由它接管;
+    // 进简录自动拉取(替代原 OK 双击刷新),子页 OK 双击回主页
+    jianlu_nav_result_t nav = jianlu_nav_key(&s_nav, (int)ev->btn,
+                                             (int)ev->btn_ev);
+    switch (nav) {
+    case JIANLU_NAV_FOCUS_CHANGED:
+        if (bsp_lvgl_lock(500)) {
+            if (s_nav.page == JIANLU_PAGE_HOME) {
+                jianlu_ui_home_focus(s_nav.home_focus);
+            } else if (s_nav.page == JIANLU_PAGE_SETTINGS) {
+                jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
+            }
+            bsp_lvgl_unlock();
         }
         return;
+    case JIANLU_NAV_PAGE_CHANGED:
+        switch_page();
+        return;
+    case JIANLU_NAV_SETTINGS_ACTION:
+        settings_action();
+        return;
+    default:
+        break;   // NO_CHANGE:简录页交给卡片堆
     }
+    if (s_nav.page != JIANLU_PAGE_JIANLU) return;
     if (ev->btn_ev != BSP_BTN_CLICK) return;
     if (s_fetch_busy) return;   // 清单重写中,忽略清单操作
     if (s_store.view != JIANLU_VIEW_READY || s_store.count == 0) return;
@@ -1027,6 +1274,7 @@ static void app_task(void *arg)
                             && s_prev_top_id[0] != '\0'
                             && strcmp(s_prev_top_id, after->id) != 0;
                 ui_refresh(arrived ? JIANLU_ANIM_ARRIVE : JIANLU_ANIM_NONE);
+                refresh_home();   // 主页待办/待同步条随之更新
             } else {
                 if (s_store.view == JIANLU_VIEW_LOADING && enter_offline()) {
                     ESP_LOGW(TAG, "中枢不可达,进入离线模式");
@@ -1153,6 +1401,7 @@ static void app_task(void *arg)
                 }
             }
             ui_refresh(JIANLU_ANIM_NONE);
+            refresh_home();   // 占位卡变化 → 主页待同步条更新
             // 显式补传循环:成功/拒收 → 续下一条;空队列 → 勾选回放 → 汇总
             if (s_drain_active) {
                 if (jianlu_capture_queue_count() > 0) {
@@ -1180,6 +1429,7 @@ static void app_task(void *arg)
                 s_drain_syncq_done = s_drain_syncq_total - (int)ev.arg2;
                 drain_summary_show();
             }
+            refresh_home();
             break;
         case EV_OFFLINE_RETRY:
             if (s_store.offline && s_wifi_connected && jianlu_hub_base()[0] != '\0') {
@@ -1188,6 +1438,35 @@ static void app_task(void *arg)
             break;
         case EV_CONFIRM_TIMEOUT:
             voice_dismiss();
+            break;
+        case EV_PROFILE_DONE:
+            if ((esp_err_t)ev.arg1 == ESP_OK) {
+                memcpy(&s_profile, &s_profile_tmp, sizeof(s_profile));
+                // 缺缓存才下载(有网进主页/二维码页也会按需刷)
+                if (s_profile.has_avatar && !jianlu_hub_cache_exists(AVATAR_PATH)) {
+                    request_job(JOB_AVATAR);
+                }
+                if (s_profile.has_qrcode && !jianlu_hub_cache_exists(QRCODE_PATH)) {
+                    request_job(JOB_QRCODE);
+                }
+            }
+            if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
+#if NAV_LINK_SELFTEST
+            if (s_nav_test_step == 0 && s_nav_test_timer == NULL &&
+                (esp_err_t)ev.arg1 == ESP_OK) {
+                nav_test_start();
+            }
+#endif
+            break;
+        case EV_AVATAR_DONE:
+            if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
+            break;
+        case EV_QR_DONE:
+            if (s_nav.page == JIANLU_PAGE_QR && bsp_lvgl_lock(500)) {
+                jianlu_ui_qr_set((esp_err_t)ev.arg1 == ESP_OK ||
+                                 jianlu_hub_cache_exists(QRCODE_PATH));
+                bsp_lvgl_unlock();
+            }
             break;
         }
     }
@@ -1198,6 +1477,7 @@ void jianlu_app_start(void)
     jianlu_store_init(&s_store);
     jianlu_voice_init(&s_voice);
     jianlu_ps_init(&s_ps);
+    jianlu_nav_init(&s_nav);
     ESP_LOGI(TAG, "堆: 启动时 %u", (unsigned)esp_get_free_heap_size());
 
     s_ev_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(app_ev_t));
@@ -1213,6 +1493,12 @@ void jianlu_app_start(void)
         ESP_LOGW(TAG, "NVS 读取失败,按无凭据处理");
     }
     jianlu_offline_load_syncq(&s_syncq);
+    // 亮度持久化:设置页可调,开机应用
+    if (s_nvs.brightness == 25 || s_nvs.brightness == 50 ||
+        s_nvs.brightness == 75 || s_nvs.brightness == 100) {
+        s_brightness = s_nvs.brightness;
+        bsp_display_backlight((uint8_t)s_brightness);
+    }
 
     if (xTaskCreate(app_task, "jianlu", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "任务创建失败,应用无法启动");

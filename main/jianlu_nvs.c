@@ -30,8 +30,22 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     read_str(h, "wifi_ssid", data->wifi_ssid, sizeof(data->wifi_ssid));
     read_str(h, "wifi_pass", data->wifi_pass, sizeof(data->wifi_pass));
     read_str(h, "hub_url", data->hub_url, sizeof(data->hub_url));
+    uint8_t bright = 0;
+    nvs_get_u8(h, "bright", &bright);
+    data->brightness = bright;
     nvs_close(h);
     return ESP_OK;
+}
+
+esp_err_t jianlu_nvs_save_brightness(uint8_t pct)
+{
+    nvs_handle_t h;
+    esp_err_t err = open(&h, NVS_READWRITE);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, "bright", pct);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
 }
 
 static esp_err_t save_pair(const char *key1, const char *val1,

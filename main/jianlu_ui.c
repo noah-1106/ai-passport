@@ -5,18 +5,25 @@
 #include <string.h>
 
 #include "bsp_battery.h"
+// 注意:LVGL 9.5 的解码器会话结构定义在私有头(公共头只有前向声明),
+// 自定义解码器必须包含它;升级 LVGL 时需复核。
+#include "image/lv_image_decoder_private.h"
 #include "jianlu_glyph.h"
 #include "jianlu_json.h"
 #include "jianlu_layout.h"
 #include "jianlu_pager.h"
+#include "jianlu_timefmt.h"
 #include "jianlu_voice.h"
 #include "lvgl.h"
+#include <sys/time.h>
 
 // ---- 配色:深色台账风,琥珀色为唯一强调色 ----
 #define UI_BG         0x10141A   // 屏幕底色(比最后的卡更深,衬出堆叠)
 #define UI_CARD_TOP   0x232C38   // 顶卡
 #define UI_CARD_MID   0x1B222C   // 第二层
 #define UI_CARD_BACK  0x151B23   // 第三层
+#define UI_CARD       0x1F2733   // 普通卡片(主页菜单格/设置行)
+#define UI_CARD_SEL   0x27313F   // 焦点/选中提亮
 #define UI_ACCENT     0xE8A33D   // 琥珀强调色(顶卡描边/待办徽标/录音点)
 #define UI_INK        0xF2EDE3   // 主文字
 #define UI_DIM        0x8A94A3   // 次要文字
@@ -795,8 +802,356 @@ void jianlu_ui_overlay_flash(const char *title, uint32_t color_hex, const char *
 }
 
 // ---------------------------------------------------------------------------
-// 电量与屏幕
+// RGB565 原图解码器(avatar.raw/qrcode.raw):自研 lv_image_decoder,
+// 从 /voicefs 文件按行读,不占整图内存(无 PSRAM 纪律)。
 // ---------------------------------------------------------------------------
+typedef struct {
+    FILE *f;
+    int w;
+    lv_draw_buf_t *partial;   // 1 行解码缓冲,close 时释放
+} raw565_t;
+
+static int raw565_width(const char *path)
+{
+    if (strstr(path, "avatar") != NULL) return 96;
+    if (strstr(path, "qrcode") != NULL) return 176;
+    return 0;
+}
+
+static lv_result_t raw565_info(lv_image_decoder_t *decoder,
+                               lv_image_decoder_dsc_t *dsc,
+                               lv_image_header_t *header)
+{
+    (void)decoder;
+    int w = raw565_width(dsc->src);
+    if (w == 0) return LV_RESULT_INVALID;
+    header->w = w;
+    header->h = w;                       // 两者都是正方形
+    header->cf = LV_COLOR_FORMAT_RGB565;
+    header->stride = w * 2;
+    return LV_RESULT_OK;
+}
+
+static lv_result_t raw565_open(lv_image_decoder_t *decoder,
+                               lv_image_decoder_dsc_t *dsc)
+{
+    (void)decoder;
+    int w = raw565_width(dsc->src);
+    if (w == 0) return LV_RESULT_INVALID;
+    FILE *f = fopen(dsc->src, "rb");
+    if (f == NULL) return LV_RESULT_INVALID;
+    raw565_t *ctx = lv_malloc(sizeof(raw565_t));
+    if (ctx == NULL) {
+        fclose(f);
+        return LV_RESULT_INVALID;
+    }
+    ctx->f = f;
+    ctx->w = w;
+    ctx->partial = NULL;
+    dsc->user_data = ctx;
+    dsc->header.w = w;
+    dsc->header.h = w;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+    dsc->header.stride = w * 2;
+    dsc->decoded = NULL;   // 标记走 get_area 逐行供给
+    return LV_RESULT_OK;
+}
+
+// get_area 逐行供给(模式参考 LVGL 内置 lv_bin_decoder):
+// 每次调用解出一行进 1 行 draw buffer,LVGL 逐行取用,不占整图内存。
+static lv_result_t raw565_get_area(lv_image_decoder_t *decoder,
+                                   lv_image_decoder_dsc_t *dsc,
+                                   const lv_area_t *full_area,
+                                   lv_area_t *decoded_area)
+{
+    (void)decoder;
+    raw565_t *ctx = dsc->user_data;
+    if (ctx == NULL || ctx->f == NULL) return LV_RESULT_INVALID;
+    int32_t w_px = lv_area_get_width(full_area);
+
+    lv_draw_buf_t *decoded;
+    if (decoded_area->y1 == LV_COORD_MIN) {
+        decoded = lv_draw_buf_reshape(ctx->partial, LV_COLOR_FORMAT_RGB565,
+                                      w_px, 1, LV_STRIDE_AUTO);
+        if (decoded == NULL) {
+            if (ctx->partial != NULL) {
+                lv_draw_buf_destroy(ctx->partial);
+                ctx->partial = NULL;
+            }
+            decoded = lv_draw_buf_create(w_px, 1, LV_COLOR_FORMAT_RGB565,
+                                         LV_STRIDE_AUTO);
+            if (decoded == NULL) return LV_RESULT_INVALID;
+            ctx->partial = decoded;
+        }
+        *decoded_area = *full_area;
+        decoded_area->y2 = decoded_area->y1;
+    } else {
+        decoded_area->y1++;
+        decoded_area->y2++;
+        decoded = ctx->partial;
+    }
+    if (decoded_area->y1 > full_area->y2) return LV_RESULT_INVALID;
+
+    long off = ((long)decoded_area->y1 * ctx->w + full_area->x1) * 2;
+    if (fseek(ctx->f, off, SEEK_SET) != 0) return LV_RESULT_INVALID;
+    size_t want = (size_t)w_px * 2;
+    if (fread(decoded->data, 1, want, ctx->f) != want) return LV_RESULT_INVALID;
+
+    dsc->decoded = decoded;
+    return LV_RESULT_OK;
+}
+
+static void raw565_close(lv_image_decoder_t *decoder,
+                         lv_image_decoder_dsc_t *dsc)
+{
+    (void)decoder;
+    raw565_t *ctx = dsc->user_data;
+    if (ctx == NULL) return;
+    if (ctx->f) fclose(ctx->f);
+    if (ctx->partial) lv_draw_buf_destroy(ctx->partial);
+    lv_free(ctx);
+}
+
+static void raw565_register(void)
+{
+    lv_image_decoder_t *dec = lv_image_decoder_create();
+    lv_image_decoder_set_info_cb(dec, raw565_info);
+    lv_image_decoder_set_open_cb(dec, raw565_open);
+    lv_image_decoder_set_get_area_cb(dec, raw565_get_area);
+    lv_image_decoder_set_close_cb(dec, raw565_close);
+}
+
+// ---------------------------------------------------------------------------
+// 页面:主页 / 二维码 / 设置(简录页 = 卡片堆,保持原有结构)
+// ---------------------------------------------------------------------------
+static lv_obj_t *s_title;      // 顶栏标题/主页时间
+static lv_obj_t *s_hint;       // 简录页底栏按键提示
+static lv_obj_t *s_home_panel;
+static lv_obj_t *s_qr_panel;
+static lv_obj_t *s_settings_panel;
+static jianlu_ui_page_t s_page = JIANLU_UI_HOME;
+static char s_time_text[8] = "--:--";
+
+// 主页部件
+static lv_obj_t *s_home_avatar_img;
+static lv_obj_t *s_home_avatar_letter;
+static lv_obj_t *s_home_nick;
+static lv_obj_t *s_home_sign;
+static lv_obj_t *s_home_todo;
+static lv_obj_t *s_home_notify;
+static lv_obj_t *s_home_notify_text;
+static lv_obj_t *s_home_cells[3];
+// 二维码页部件
+static lv_obj_t *s_qr_img;
+static lv_obj_t *s_qr_hint;
+// 设置页部件
+#define SETTINGS_ROWS 4
+static lv_obj_t *s_set_rows[SETTINGS_ROWS];
+static lv_obj_t *s_set_vals[SETTINGS_ROWS];
+
+static const char *const SETTING_NAMES[SETTINGS_ROWS] = {
+    "屏幕亮度", "立即同步", "关于", "重新配网",
+};
+
+static void home_build(lv_obj_t *scr)
+{
+    s_home_panel = panel_create(scr, 0, 44, 240, 276, UI_BG, 0);
+    lv_obj_set_style_border_width(s_home_panel, 0, 0);
+
+    // 头像容器(圆角裁切) + 图/首字占位
+    lv_obj_t *avatar = panel_create(s_home_panel, 20, 12, 96, 96, UI_CARD_TOP, 12);
+    lv_obj_set_style_clip_corner(avatar, true, 0);
+    s_home_avatar_img = lv_image_create(avatar);
+    lv_obj_center(s_home_avatar_img);
+    lv_obj_add_flag(s_home_avatar_img, LV_OBJ_FLAG_HIDDEN);
+    s_home_avatar_letter = text_create(avatar, 0, 0, 96, UI_ACCENT);
+    lv_obj_set_style_text_align(s_home_avatar_letter, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_height(s_home_avatar_letter, 96);
+    lv_obj_set_style_pad_top(s_home_avatar_letter, 36, 0);
+
+    s_home_nick = text_create(s_home_panel, 128, 20, 100, UI_INK);
+    lv_label_set_long_mode(s_home_nick, LV_LABEL_LONG_DOT);
+    s_home_sign = text_create(s_home_panel, 128, 48, 100, UI_DIM);
+    lv_obj_set_height(s_home_sign, 60);
+    lv_label_set_long_mode(s_home_sign, LV_LABEL_LONG_DOT);
+
+    // 近期待办横条
+    lv_obj_t *todo_panel = panel_create(s_home_panel, 20, 120, 200, 56,
+                                        UI_CARD_TOP, 10);
+    lv_obj_t *todo_tag = text_create(todo_panel, 10, 6, 100, UI_DIM);
+    lv_label_set_text(todo_tag, "最近待办");
+    s_home_todo = text_create(todo_panel, 10, 26, 184, UI_INK);
+    lv_label_set_long_mode(s_home_todo, LV_LABEL_LONG_DOT);
+
+    // 待同步通知条(琥珀)
+    s_home_notify = panel_create(s_home_panel, 20, 184, 200, 26, UI_ACCENT, 8);
+    s_home_notify_text = lv_label_create(s_home_notify);
+    lv_obj_set_style_text_font(s_home_notify_text, &s_font_cjk, 0);
+    lv_obj_set_style_text_color(s_home_notify_text, lv_color_hex(UI_BG), 0);
+    lv_obj_center(s_home_notify_text);
+
+    // 底部菜单三格
+    static const char *const CELL_NAMES[3] = { "录", "码", "设" };
+    static const char *const CELL_LABELS[3] = { "简录", "二维码", "设置" };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *cell = panel_create(s_home_panel, 16 + i * 72, 216, 64, 56,
+                                      UI_CARD, 10);
+        lv_obj_t *badge = panel_create(cell, 21, 6, 22, 22, UI_ACCENT, 6);
+        lv_obj_t *btext = lv_label_create(badge);
+        lv_obj_set_style_text_font(btext, &s_font_cjk, 0);
+        lv_obj_set_style_text_color(btext, lv_color_hex(UI_BG), 0);
+        lv_label_set_text(btext, CELL_NAMES[i]);
+        lv_obj_center(btext);
+        lv_obj_t *name = text_create(cell, 0, 32, 64, UI_DIM);
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(name, CELL_LABELS[i]);
+        s_home_cells[i] = cell;
+    }
+}
+
+static void qr_build(lv_obj_t *scr)
+{
+    s_qr_panel = panel_create(scr, 0, 44, 240, 276, UI_BG, 0);
+    lv_obj_set_style_border_width(s_qr_panel, 0, 0);
+
+    lv_obj_t *frame = panel_create(s_qr_panel, 32, 12, 176, 176, 0xFFFFFF, 4);
+    lv_obj_set_style_clip_corner(frame, true, 0);
+    s_qr_img = lv_image_create(frame);
+    lv_obj_center(s_qr_img);
+
+    s_qr_hint = text_create(s_qr_panel, 20, 200, 200, UI_DIM);
+    lv_obj_set_style_text_align(s_qr_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_qr_hint, "扫一扫加微信");
+}
+
+static void settings_build(lv_obj_t *scr)
+{
+    s_settings_panel = panel_create(scr, 0, 44, 240, 276, UI_BG, 0);
+    lv_obj_set_style_border_width(s_settings_panel, 0, 0);
+
+    for (int i = 0; i < SETTINGS_ROWS; i++) {
+        lv_obj_t *row = panel_create(s_settings_panel, 20, 14 + i * 38, 200, 30,
+                                     UI_CARD, 8);
+        lv_obj_t *name = text_create(row, 10, 6, 110, UI_INK);
+        lv_label_set_text(name, SETTING_NAMES[i]);
+        lv_obj_t *val = text_create(row, 120, 6, 70, UI_DIM);
+        lv_obj_set_style_text_align(val, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(val, "");
+        s_set_rows[i] = row;
+        s_set_vals[i] = val;
+    }
+}
+
+void jianlu_ui_show_page(jianlu_ui_page_t page)
+{
+    s_page = page;
+    if (page == JIANLU_UI_HOME) {
+        lv_label_set_text(s_title, s_time_text);
+    } else if (page == JIANLU_UI_JIANLU) {
+        lv_label_set_text(s_title, "小诺简录");
+    } else if (page == JIANLU_UI_QR) {
+        lv_label_set_text(s_title, "二维码");
+    } else {
+        lv_label_set_text(s_title, "设置");
+    }
+    // 主页显隐由 refresh 按 view 决定(非 READY 时让位给状态层);
+    // 二维码/设置页随选择显示
+    page == JIANLU_UI_QR ? lv_obj_remove_flag(s_qr_panel, LV_OBJ_FLAG_HIDDEN)
+                         : lv_obj_add_flag(s_qr_panel, LV_OBJ_FLAG_HIDDEN);
+    page == JIANLU_UI_SETTINGS
+        ? lv_obj_remove_flag(s_settings_panel, LV_OBJ_FLAG_HIDDEN)
+        : lv_obj_add_flag(s_settings_panel, LV_OBJ_FLAG_HIDDEN);
+    if (page == JIANLU_UI_JIANLU) {
+        lv_obj_remove_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void jianlu_ui_home_set(const jianlu_profile_t *prof,
+                        const jianlu_home_model_t *model, bool avatar_ok)
+{
+    if (model != NULL) {
+        jianlu_utf8_copy(s_time_text, sizeof(s_time_text), model->time_hhmm,
+                         sizeof(s_time_text) - 1);
+        if (s_page == JIANLU_UI_HOME) lv_label_set_text(s_title, s_time_text);
+        if (model->has_todo) {
+            static char todo[JIANLU_TITLE_LEN + 16];
+            sanitize_text(todo, sizeof(todo), model->todo_title);
+            size_t used = strlen(todo);
+            snprintf(todo + used, sizeof(todo) - used, "  %s", model->todo_date);
+            lv_label_set_text(s_home_todo, todo);
+        } else {
+            lv_label_set_text(s_home_todo, "暂无待办");
+        }
+        if (model->pending_sync > 0) {
+            lv_label_set_text_fmt(s_home_notify_text, "%d 条待同步",
+                                  model->pending_sync);
+            lv_obj_remove_flag(s_home_notify, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_home_notify, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    static char nick[JIANLU_NICKNAME_LEN];
+    static char sign[JIANLU_SIGNATURE_LEN];
+    sanitize_text(nick, sizeof(nick), prof ? prof->nickname : NULL);
+    sanitize_text(sign, sizeof(sign), prof ? prof->signature : NULL);
+    lv_label_set_text(s_home_nick, nick[0] ? nick : "小诺用户");
+    lv_label_set_text(s_home_sign, sign);
+
+    bool show_img = avatar_ok;
+    if (show_img) {
+        lv_image_set_src(s_home_avatar_img, "/voicefs/avatar.raw");
+        lv_obj_remove_flag(s_home_avatar_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_home_avatar_letter, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_home_avatar_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_home_avatar_letter, LV_OBJ_FLAG_HIDDEN);
+        // 首字占位
+        char first[4] = "小";
+        if (nick[0]) {
+            const char *p = nick;
+            utf8_next(&p);
+            size_t n = (size_t)(p - nick);
+            if (n < sizeof(first)) memcpy(first, nick, n), first[n] = '\0';
+        }
+        lv_label_set_text(s_home_avatar_letter, first);
+    }
+}
+
+void jianlu_ui_home_focus(int focus)
+{
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_style_border_width(s_home_cells[i], i == focus ? 2 : 0, 0);
+        lv_obj_set_style_border_color(s_home_cells[i], lv_color_hex(UI_ACCENT), 0);
+        lv_obj_set_style_bg_color(s_home_cells[i],
+            lv_color_hex(i == focus ? UI_CARD_SEL : UI_CARD), 0);
+    }
+}
+
+void jianlu_ui_qr_set(bool available)
+{
+    if (available) {
+        lv_image_set_src(s_qr_img, "/voicefs/qrcode.raw");
+        lv_obj_remove_flag(s_qr_img, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_qr_hint, "扫一扫加微信");
+    } else {
+        lv_obj_add_flag(s_qr_img, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_qr_hint, "在中枢 Web 端\n上传你的微信二维码");
+    }
+}
+
+void jianlu_ui_settings_set(int focus, int brightness_pct)
+{
+    for (int i = 0; i < SETTINGS_ROWS; i++) {
+        lv_obj_set_style_border_width(s_set_rows[i], i == focus ? 2 : 0, 0);
+        lv_obj_set_style_border_color(s_set_rows[i], lv_color_hex(UI_ACCENT), 0);
+        lv_obj_set_style_bg_color(s_set_rows[i],
+            lv_color_hex(i == focus ? UI_CARD_SEL : UI_CARD), 0);
+    }
+    lv_label_set_text_fmt(s_set_vals[0], "%d%%", brightness_pct);
+}
+
 static void battery_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -807,11 +1162,23 @@ static void battery_tick(lv_timer_t *timer)
         lv_obj_remove_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text_fmt(s_battery, "%d%%", soc);
     }
+    // 主页顶栏时间(Date 头对时后有效;未对时 "--:--")
+    if (s_page == JIANLU_UI_HOME) {
+        uint32_t epoch = (uint32_t)time(NULL);
+        if (jianlu_time_is_valid(epoch)) {
+            char full[16];
+            jianlu_time_format_mmdd_hhmm(epoch, full, sizeof(full));
+            jianlu_utf8_copy(s_time_text, sizeof(s_time_text), full + 6,
+                             sizeof(s_time_text) - 1);
+            lv_label_set_text(s_title, s_time_text);
+        }
+    }
 }
 
 void jianlu_ui_create(void)
 {
     fonts_init();
+    raw565_register();
 
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(UI_BG), 0);
@@ -820,8 +1187,8 @@ void jianlu_ui_create(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = text_create(scr, 20, 13, 140, UI_INK);
-    lv_label_set_text(title, "小诺简录");
+    s_title = text_create(scr, 20, 13, 140, UI_INK);
+    lv_label_set_text(s_title, "小诺简录");
 
     s_battery = lv_label_create(scr);
     lv_obj_set_pos(s_battery, 182, 15);
@@ -845,9 +1212,13 @@ void jianlu_ui_create(void)
     lv_label_set_text(s_status, "");
     (void)divider;
 
-    lv_obj_t *hint = text_create(scr, 10, 296, 220, UI_DIM);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(hint, "OK 完成 · 按住说话 · 双击刷新");
+    s_hint = text_create(scr, 10, 296, 220, UI_DIM);
+    lv_obj_set_style_text_align(s_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_hint, "OK 完成 · 按住说话 · 双击回主页");
+
+    home_build(scr);
+    qr_build(scr);
+    settings_build(scr);
 
     voice_build(scr);
     flash_build(scr);
@@ -856,14 +1227,39 @@ void jianlu_ui_create(void)
     lv_timer_create(battery_tick, 10000, NULL);
     battery_tick(NULL);
 
+    // v2:默认主页;启动阶段(非 READY)由状态层覆盖显示
+    jianlu_ui_show_page(JIANLU_UI_HOME);
+    lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);   // 主页无底栏提示
+
     lv_screen_load(scr);
 }
 
 void jianlu_ui_refresh(const jianlu_store_t *store, jianlu_anim_t anim)
 {
-    deck_refresh(store, anim);
-    bool show_list = store->view == JIANLU_VIEW_READY && store->count > 0;
-    lv_label_set_text(s_status, show_list ? "" : status_text(store));
+    // 卡片堆只在简录页渲染;其他页不碰(状态层在非 READY 时接管显示)
+    bool deck_page = s_page == JIANLU_UI_JIANLU;
+    bool ready_list = store->view == JIANLU_VIEW_READY && store->count > 0;
+
+    if (deck_page) {
+        deck_refresh(store, anim);
+        lv_label_set_text(s_status, ready_list ? "" : status_text(store));
+        lv_obj_add_flag(s_home_panel, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        // 非简录页:藏卡片堆;主页仅 READY 时显示(非 READY 让位状态层)
+        for (int i = 0; i < 3; i++) {
+            lv_obj_add_flag(s_slots[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        bool home_visible = s_page == JIANLU_UI_HOME
+                         && store->view == JIANLU_VIEW_READY;
+        if (home_visible) {
+            lv_obj_remove_flag(s_home_panel, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_home_panel, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_label_set_text(s_status,
+                          store->view == JIANLU_VIEW_READY ? ""
+                                                           : status_text(store));
+    }
     if (store->offline && store->view == JIANLU_VIEW_READY) {
         lv_obj_remove_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
     } else {

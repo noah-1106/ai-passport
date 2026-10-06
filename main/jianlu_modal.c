@@ -13,6 +13,7 @@ jianlu_modal_act_t jianlu_modal_key(jianlu_modal_t modal, int btn, int ev)
         }
         return JIANLU_MODAL_SKIP;          // UP/DOWN 单击:跳过
     case JIANLU_MODAL_SUMMARY:
+    case JIANLU_MODAL_INFO:
         if (btn == JIANLU_BTN_OK && ev == JIANLU_EV_CLICK) {
             return JIANLU_MODAL_DISMISS;
         }

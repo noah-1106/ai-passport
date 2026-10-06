@@ -40,5 +40,13 @@ int main(void) {
                             JIANLU_EV_CLICK) == JIANLU_MODAL_SWALLOW);
     assert(jianlu_modal_key(JIANLU_MODAL_SUMMARY, JIANLU_BTN_DOWN,
                             JIANLU_EV_LONG) == JIANLU_MODAL_SWALLOW);
+
+    // 信息页(关于):同汇总页语义
+    assert(jianlu_modal_key(JIANLU_MODAL_INFO, JIANLU_BTN_OK,
+                            JIANLU_EV_CLICK) == JIANLU_MODAL_DISMISS);
+    assert(jianlu_modal_key(JIANLU_MODAL_INFO, JIANLU_BTN_UP,
+                            JIANLU_EV_CLICK) == JIANLU_MODAL_SWALLOW);
+    assert(jianlu_modal_key(JIANLU_MODAL_INFO, JIANLU_BTN_OK,
+                            JIANLU_EV_PRESS) == JIANLU_MODAL_SWALLOW);
     return 0;
 }

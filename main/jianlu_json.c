@@ -115,3 +115,31 @@ int jianlu_json_parse_capture(const char *body, size_t len, jianlu_capture_resul
     cJSON_Delete(root);
     return 0;
 }
+
+static bool json_bool(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsBool(item) ? cJSON_IsTrue(item) : false;
+}
+
+int jianlu_json_parse_profile(const char *body, size_t len, jianlu_profile_t *out)
+{
+    if (body == NULL || out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+
+    cJSON *root = cJSON_ParseWithLength(body, len);
+    if (root == NULL) return -1;
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return -1;
+    }
+    jianlu_utf8_copy(out->nickname, sizeof(out->nickname),
+                     json_string(root, "nickname"), sizeof(out->nickname) - 1);
+    jianlu_utf8_copy(out->signature, sizeof(out->signature),
+                     json_string(root, "signature"), sizeof(out->signature) - 1);
+    out->has_avatar = json_bool(root, "hasAvatar");
+    out->has_qrcode = json_bool(root, "hasQrcode");
+
+    cJSON_Delete(root);
+    return 0;
+}

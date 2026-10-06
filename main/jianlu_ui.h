@@ -18,8 +18,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "jianlu_home.h"
 #include "jianlu_json.h"
 #include "jianlu_store.h"
+
+// 页面(v2 导航模型)
+typedef enum {
+    JIANLU_UI_HOME = 0,   // 主页(开机默认)
+    JIANLU_UI_JIANLU,     // 简录卡片堆
+    JIANLU_UI_QR,         // 二维码
+    JIANLU_UI_SETTINGS,   // 设置
+} jianlu_ui_page_t;
 
 typedef enum {
     JIANLU_ANIM_NONE = 0,   // 直接重排(状态页切换、首次加载)
@@ -74,3 +83,20 @@ void jianlu_ui_overlay(const char *title, uint32_t color_hex,
 void jianlu_ui_overlay_hide(void);
 // 短暂提示浮层(1.5s 自动消失,不拦截按键),如"队列已满"。
 void jianlu_ui_overlay_flash(const char *title, uint32_t color_hex, const char *body);
+
+// ---- 页面(v2)----
+// 切换页面:主页/简录/二维码/设置。简录页内容由 jianlu_ui_refresh 刷新;
+// 其余页内容用各自的 set 函数。离线标识/电量为全局顶栏。
+void jianlu_ui_show_page(jianlu_ui_page_t page);
+
+// 主页:资料(昵称/签名/有无头像)+ 视图模型(时间/离线/待同步/近期待办)
+// + 菜单焦点。prof 可为 NULL(未拉到资料),avatar_ok=头像缓存可用。
+void jianlu_ui_home_set(const jianlu_profile_t *prof,
+                        const jianlu_home_model_t *model, bool avatar_ok);
+void jianlu_ui_home_focus(int focus);   // 0 简录 1 二维码 2 设置
+
+// 二维码页:available=有缓存图可显示,否则显示引导文案
+void jianlu_ui_qr_set(bool available);
+
+// 设置页:焦点行 + 亮度百分比
+void jianlu_ui_settings_set(int focus, int brightness_pct);

@@ -110,6 +110,14 @@ run_static_checks() {
         tests/test_jianlu_modal.c main/jianlu_modal.c \
         -o "${test_dir}/test_jianlu_modal"
     "${test_dir}/test_jianlu_modal"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_nav.c main/jianlu_nav.c \
+        -o "${test_dir}/test_jianlu_nav"
+    "${test_dir}/test_jianlu_nav"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_jianlu_home.c main/jianlu_home.c main/jianlu_store.c main/jianlu_timefmt.c \
+        -o "${test_dir}/test_jianlu_home"
+    "${test_dir}/test_jianlu_home"
     # JSON 解析测试直接编 ESP-IDF 源码树里的 cJSON;未激活 IDF 时跳过。
     if [[ -n "${IDF_PATH:-}" && -f "${IDF_PATH}/components/json/cJSON/cJSON.c" ]]; then
         "${CC:-cc}" -std=c11 -Wall -Wextra \

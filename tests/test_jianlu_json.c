@@ -121,6 +121,28 @@ static void test_parse_capture_response(void) {
     assert(jianlu_json_parse_capture(bad, sizeof(bad) - 1, &out) == -1);
 }
 
+static void test_parse_profile(void) {
+    static const char body[] =
+        "{\"nickname\":\"陈一诺\",\"signature\":\"随时记录\","
+        "\"hasAvatar\":true,\"hasQrcode\":false}";
+    jianlu_profile_t out;
+    assert(jianlu_json_parse_profile(body, sizeof(body) - 1, &out) == 0);
+    assert(strcmp(out.nickname, "陈一诺") == 0);
+    assert(strcmp(out.signature, "随时记录") == 0);
+    assert(out.has_avatar);
+    assert(!out.has_qrcode);
+
+    // 空资料(出厂)
+    static const char empty[] =
+        "{\"nickname\":\"\",\"signature\":\"\",\"hasAvatar\":false,\"hasQrcode\":false}";
+    assert(jianlu_json_parse_profile(empty, sizeof(empty) - 1, &out) == 0);
+    assert(out.nickname[0] == '\0');
+    assert(!out.has_avatar);
+
+    static const char bad[] = "{\"nickname\":";
+    assert(jianlu_json_parse_profile(bad, sizeof(bad) - 1, &out) == -1);
+}
+
 int main(void) {
     test_parse_happy_path();
     test_parse_numeric_id();
@@ -128,5 +150,6 @@ int main(void) {
     test_parse_invalid_json();
     test_parse_long_fields_truncated();
     test_parse_capture_response();
+    test_parse_profile();
     return 0;
 }

@@ -10,6 +10,7 @@ typedef enum {
     JIANLU_MODAL_NONE = 0,     // 无模态,事件放行到列表层
     JIANLU_MODAL_SYNC_PROMPT,  // 「发现离线内容」:OK 开始同步,其他键跳过
     JIANLU_MODAL_SUMMARY,      // 「同步完成/中断」:OK 返回,其余吞掉
+    JIANLU_MODAL_INFO,         // 信息页(关于等):OK 单击关闭,其余吞掉
 } jianlu_modal_t;
 
 // 按键与事件(与 bsp_button.h 的取值一致,纯模块不依赖 BSP 头)

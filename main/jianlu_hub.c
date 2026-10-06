@@ -132,8 +132,7 @@ esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_le
 }
 
 esp_err_t jianlu_hub_complete(const char *id)
-{
-    if (s_base[0] == '\0') return ESP_ERR_INVALID_STATE;
+{    if (s_base[0] == '\0') return ESP_ERR_INVALID_STATE;
     char url[192];
     int n = snprintf(url, sizeof(url), "%s/api/records/%s", s_base, id);
     if (n <= 0 || (size_t)n >= sizeof(url)) return ESP_ERR_INVALID_ARG;
@@ -162,5 +161,120 @@ esp_err_t jianlu_hub_complete(const char *id)
         ESP_LOGW(TAG, "完成上报失败 id=%s: HTTP %d", id, status);
         return ESP_ERR_INVALID_RESPONSE;
     }
+    return ESP_OK;
+}
+
+esp_err_t jianlu_hub_fetch_profile(jianlu_profile_t *out)
+{
+    if (s_base[0] == '\0') return ESP_ERR_INVALID_STATE;
+    char url[160];
+    int n = snprintf(url, sizeof(url), "%s/api/profile", s_base);
+    if (n <= 0 || (size_t)n >= sizeof(url)) return ESP_ERR_INVALID_ARG;
+
+    s_body_len = 0;
+    s_body_overflow = false;
+    s_resp_date[0] = '\0';
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .event_handler = on_http_event,
+        .timeout_ms = HUB_TIMEOUT_MS,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "资料拉取失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (status != 200) return ESP_ERR_INVALID_RESPONSE;
+    if (jianlu_json_parse_profile(s_body, s_body_len, out) != 0) {
+        ESP_LOGW(TAG, "资料 JSON 解析失败");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    ESP_LOGI(TAG, "资料: \"%s\" avatar=%d qr=%d", out->nickname,
+             (int)out->has_avatar, (int)out->has_qrcode);
+    return ESP_OK;
+}
+
+bool jianlu_hub_cache_exists(const char *file_path)
+{
+    FILE *f = fopen(file_path, "rb");
+    if (f == NULL) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+    return size > 0;
+}
+
+esp_err_t jianlu_hub_download_file(const char *api_path, const char *file_path)
+{
+    if (s_base[0] == '\0') return ESP_ERR_INVALID_STATE;
+    char url[192];
+    int n = snprintf(url, sizeof(url), "%s%s", s_base, api_path);
+    if (n <= 0 || (size_t)n >= sizeof(url)) return ESP_ERR_INVALID_ARG;
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = HUB_TIMEOUT_MS,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) return ESP_ERR_NO_MEM;
+
+    size_t scratch_len = 0;
+    uint8_t *chunk = jianlu_net_scratch(&scratch_len);
+    if (scratch_len < 2048) {
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    int status = 0;
+    FILE *f = NULL;
+    size_t got_total = 0;
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        status = esp_http_client_get_status_code(client);
+        if (status != 200) {
+            err = ESP_ERR_NOT_FOUND;
+        } else {
+            f = fopen(file_path, "wb");
+            if (f == NULL) {
+                err = ESP_FAIL;
+            } else {
+                for (;;) {
+                    int r = esp_http_client_read(client, (char *)chunk, 2048);
+                    if (r < 0) { err = ESP_FAIL; break; }
+                    if (r == 0) break;
+                    if (fwrite(chunk, 1, (size_t)r, f) != (size_t)r) {
+                        err = ESP_FAIL;
+                        break;
+                    }
+                    got_total += (size_t)r;
+                }
+                fclose(f);
+            }
+        }
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "下载失败 %s: %s", api_path, esp_err_to_name(err));
+        if (f != NULL || got_total > 0) remove(file_path);   // 半成品不留
+        if (f == NULL && got_total == 0 && err == ESP_ERR_NOT_FOUND) {
+            remove(file_path);   // 404:清掉过期缓存,避免误用
+        }
+        return err;
+    }
+    ESP_LOGI(TAG, "下载完成 %s → %s(%u 字节)", api_path, file_path,
+             (unsigned)got_total);
     return ESP_OK;
 }

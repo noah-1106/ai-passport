@@ -25,7 +25,9 @@ idf_component_register(
          "jianlu_voiceq.c"
          "jianlu_timefmt.c"
          "jianlu_modal.c"
+         "jianlu_nav.c"
+         "jianlu_home.c"
          "../assets/fonts/jianlu_font_16.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp bt esp_event esp_http_client esp_netif esp_timer esp_wifi json mbedtls nvs_flash spiffs
+    REQUIRES bsp bt esp_app_format esp_event esp_http_client esp_netif esp_timer esp_wifi json mbedtls nvs_flash spiffs
 )

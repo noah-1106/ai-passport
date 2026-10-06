@@ -1,6 +1,7 @@
 // main/jianlu_json.h —— 中枢响应 JSON 解析(只取需要的字段,逐条写入 store)。
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "jianlu_store.h"
@@ -27,3 +28,18 @@ typedef struct {
 // 解析 {"transcript":...,"reply":...,"records":[...]}。字段缺失按空串/0 处理。
 // 返回 0;JSON 结构错误返回 -1。
 int jianlu_json_parse_capture(const char *body, size_t len, jianlu_capture_result_t *out);
+
+// GET /api/profile 响应
+#define JIANLU_NICKNAME_LEN  64
+#define JIANLU_SIGNATURE_LEN 128
+
+typedef struct {
+    char nickname[JIANLU_NICKNAME_LEN];
+    char signature[JIANLU_SIGNATURE_LEN];
+    bool has_avatar;
+    bool has_qrcode;
+} jianlu_profile_t;
+
+// 解析 {"nickname":...,"signature":...,"hasAvatar":bool,"hasQrcode":bool}。
+// 返回 0;结构错误返回 -1。
+int jianlu_json_parse_profile(const char *body, size_t len, jianlu_profile_t *out);
