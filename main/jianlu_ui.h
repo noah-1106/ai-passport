@@ -94,6 +94,7 @@ void jianlu_ui_show_page(jianlu_ui_page_t page);
 
 // 主页:资料(昵称/签名/有无头像)+ 视图模型(时间/离线/待同步/近期待办)
 // + 菜单焦点。prof 可为 NULL(未拉到资料),avatar_ok=头像缓存可用。
+void jianlu_ui_avatar_dirty(void);
 void jianlu_ui_home_set(const jianlu_profile_t *prof,
                         const jianlu_home_model_t *model, bool avatar_ok);
 void jianlu_ui_home_focus(int focus);   // 0 简录 1 二维码 2 设置

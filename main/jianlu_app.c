@@ -1484,6 +1484,7 @@ static void app_task(void *arg)
 #endif
             break;
         case EV_AVATAR_DONE:
+            jianlu_ui_avatar_dirty();
             if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
             break;
         case EV_QR_DONE:

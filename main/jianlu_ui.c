@@ -15,6 +15,7 @@
 #include "jianlu_timefmt.h"
 #include "jianlu_voice.h"
 #include "lvgl.h"
+#include "esp_log.h"
 #include <sys/time.h>
 
 // ---- 配色:深色台账风,琥珀色为唯一强调色 ----
@@ -811,8 +812,22 @@ typedef struct {
     lv_draw_buf_t *partial;   // 1 行解码缓冲,close 时释放
 } raw565_t;
 
+static bool s_avatar_dirty = true;  // 头像文件重下后置位,下一次 home_set 强制重设源
+
+void jianlu_ui_avatar_dirty(void)
+{
+    s_avatar_dirty = true;
+}
+
+// LVGL 9 的文件 src 必须带盘符("P:/…")才会走解码器;fopen 时剥掉
+static const char *raw565_fs_path(const char *src)
+{
+    return (src[0] != '\0' && src[1] == ':') ? src + 2 : src;
+}
+
 static int raw565_width(const char *path)
 {
+    path = raw565_fs_path(path);
     if (strstr(path, "avatar") != NULL) return 96;
     if (strstr(path, "qrcode") != NULL) return 176;
     return 0;
@@ -838,7 +853,7 @@ static lv_result_t raw565_open(lv_image_decoder_t *decoder,
     (void)decoder;
     int w = raw565_width(dsc->src);
     if (w == 0) return LV_RESULT_INVALID;
-    FILE *f = fopen(dsc->src, "rb");
+    FILE *f = fopen(raw565_fs_path(dsc->src), "rb");
     if (f == NULL) return LV_RESULT_INVALID;
     raw565_t *ctx = lv_malloc(sizeof(raw565_t));
     if (ctx == NULL) {
@@ -1101,7 +1116,12 @@ void jianlu_ui_home_set(const jianlu_profile_t *prof,
 
     bool show_img = avatar_ok;
     if (show_img) {
-        lv_image_set_src(s_home_avatar_img, "/voicefs/avatar.raw");
+        // 源未变且文件未更新时跳过重设,避免重解码闪烁;下载完成后置 dirty 强制刷新一次
+        const void *cur = lv_image_get_src(s_home_avatar_img);
+        if (s_avatar_dirty || cur == NULL || strcmp((const char *)cur, "P:/voicefs/avatar.raw") != 0) {
+            lv_image_set_src(s_home_avatar_img, "P:/voicefs/avatar.raw");
+            s_avatar_dirty = false;
+        }
         lv_obj_remove_flag(s_home_avatar_img, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_home_avatar_letter, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -1132,7 +1152,7 @@ void jianlu_ui_home_focus(int focus)
 void jianlu_ui_qr_set(bool available)
 {
     if (available) {
-        lv_image_set_src(s_qr_img, "/voicefs/qrcode.raw");
+        lv_image_set_src(s_qr_img, "P:/voicefs/qrcode.raw");
         lv_obj_remove_flag(s_qr_img, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(s_qr_hint, "扫一扫加微信");
     } else {

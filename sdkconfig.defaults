@@ -70,3 +70,7 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 
 # 「关于」页:本地 lv_qrcode 生成作者主页二维码。
 CONFIG_LV_USE_QRCODE=y
+# raw565 图片经 lv_fs 走 POSIX 文件系统(P: 盘符,见 jianlu_ui raw565 解码器)
+CONFIG_LV_USE_FS_POSIX=y
+CONFIG_LV_FS_POSIX_LETTER=80
+CONFIG_LV_FS_POSIX_PATH=""
