@@ -11,7 +11,7 @@ void jianlu_ps_init(jianlu_ps_t *ps)
 
 uint8_t jianlu_ps_tick(jianlu_ps_t *ps)
 {
-    if (ps->busy) {
+    if (ps->busy || ps->keep_on) {
         ps->idle_s = 0;
         return JIANLU_PS_ACT_NONE;
     }
@@ -43,6 +43,15 @@ bool jianlu_ps_key(jianlu_ps_t *ps, bool gesture_end)
         return true;
     }
     return false;
+}
+
+void jianlu_ps_set_keep_on(jianlu_ps_t *ps, bool keep_on)
+{
+    ps->keep_on = keep_on;
+    if (keep_on) {
+        ps->idle_s = 0;
+        ps->screen_on = true;   // 开常亮立即亮屏
+    }
 }
 
 void jianlu_ps_set_busy(jianlu_ps_t *ps, bool busy)

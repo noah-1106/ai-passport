@@ -33,19 +33,34 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     uint8_t bright = 0;
     nvs_get_u8(h, "bright", &bright);
     data->brightness = bright;
+    uint8_t keepon = 0;
+    nvs_get_u8(h, "keepon", &keepon);
+    data->keep_on = keepon;
     nvs_close(h);
     return ESP_OK;
 }
 
-esp_err_t jianlu_nvs_save_brightness(uint8_t pct)
+esp_err_t jianlu_nvs_save_brightness(uint8_t pct);
+
+static esp_err_t nvs_save_u8(const char *key, uint8_t val)
 {
     nvs_handle_t h;
     esp_err_t err = open(&h, NVS_READWRITE);
     if (err != ESP_OK) return err;
-    err = nvs_set_u8(h, "bright", pct);
+    err = nvs_set_u8(h, key, val);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
+}
+
+esp_err_t jianlu_nvs_save_brightness(uint8_t pct)
+{
+    return nvs_save_u8("bright", pct);
+}
+
+esp_err_t jianlu_nvs_save_keep_on(uint8_t on)
+{
+    return nvs_save_u8("keepon", on);
 }
 
 static esp_err_t save_pair(const char *key1, const char *val1,

@@ -144,6 +144,7 @@ static jianlu_nav_t s_nav;
 static jianlu_profile_t s_profile;      // 应用任务所有
 static jianlu_profile_t s_profile_tmp;  // 网络任务写,EV_PROFILE_DONE 时提交
 static int s_brightness = 100;          // 25/50/75/100
+static bool s_keep_on;                  // 屏幕常亮
 static bool s_info_shown;               // 「关于」信息页显示中
 
 #define AVATAR_PATH "/voicefs/avatar.raw"
@@ -166,22 +167,11 @@ static esp_timer_handle_t s_confirm_timer;
 // 导航自检脚本:{btn, ev},每 1.2s 注入一个
 typedef struct { bsp_btn_t btn; bsp_btn_ev_t ev; } nav_test_key_t;
 static const nav_test_key_t NAV_TEST_SCRIPT[] = {
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 主页焦点 0→1
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点 1→2(设置)
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进设置
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 亮度循环
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 亮度再循环
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 设置焦点 →1(立即同步)
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进二维码(焦点 1... 等 focus)
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 主页焦点回退
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 到焦点 0(简录)
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进简录(自动 fresh)
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 翻卡
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 回主页
-    { BSP_BTN_OK,   BSP_BTN_LONG },   // 全局按住说话(设置页无关,验证可达性)
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 收尾(无操作)
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },
+    { BSP_BTN_OK,   BSP_BTN_CLICK },
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 常亮 开(之后静置)
 };
 #define NAV_TEST_STEPS (sizeof(NAV_TEST_SCRIPT) / sizeof(NAV_TEST_SCRIPT[0]))
 static esp_timer_handle_t s_nav_test_timer;
@@ -563,11 +553,16 @@ static void switch_page(void)
         break;
     case JIANLU_PAGE_SETTINGS:
         if (bsp_lvgl_lock(500)) {
-            jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
+            jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
+                                   s_keep_on);
             bsp_lvgl_unlock();
         }
         break;
     default:   // 主页
+        // 有网就顺带刷新资料(Web 端可能刚改过昵称/头像);失败用现有资料,不阻塞渲染
+        if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+            request_job(JOB_PROFILE);
+        }
         refresh_home();
         if (bsp_lvgl_lock(500)) {
             jianlu_ui_home_focus(s_nav.home_focus);
@@ -582,15 +577,20 @@ static void switch_page(void)
 static const int BRIGHTNESS_LEVELS[] = { 25, 50, 75, 100 };
 #define BRIGHTNESS_LEVELS_N 4
 
+static void settings_refresh(void)
+{
+    if (s_nav.page == JIANLU_PAGE_SETTINGS && bsp_lvgl_lock(500)) {
+        jianlu_ui_settings_set(s_nav.settings_focus, s_brightness, s_keep_on);
+        bsp_lvgl_unlock();
+    }
+}
+
 static void brightness_apply(int pct)
 {
     s_brightness = pct;
     bsp_display_backlight((uint8_t)pct);
     jianlu_nvs_save_brightness((uint8_t)pct);
-    if (s_nav.page == JIANLU_PAGE_SETTINGS && bsp_lvgl_lock(500)) {
-        jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
-        bsp_lvgl_unlock();
-    }
+    settings_refresh();
 }
 
 static void brightness_adjust(int dir)
@@ -618,9 +618,22 @@ static void show_about(void)
     }
     s_info_shown = true;
     if (bsp_lvgl_lock(500)) {
-        jianlu_ui_overlay("关于", 0xE8A33D, ver, "OK 返回");
+        jianlu_ui_about(ver);
         bsp_lvgl_unlock();
     }
+}
+
+static void keepon_toggle(void)
+{
+    s_keep_on = !s_keep_on;
+    jianlu_ps_set_keep_on(&s_ps, s_keep_on);
+    jianlu_nvs_save_keep_on(s_keep_on ? 1 : 0);
+    if (s_keep_on) {
+        bsp_display_backlight((uint8_t)s_brightness);   // 开常亮立即点亮
+        s_screen_off = false;
+    }
+    settings_refresh();
+    ESP_LOGI(TAG, "屏幕常亮: %s", s_keep_on ? "开" : "关");
 }
 
 static void settings_action(void)
@@ -629,7 +642,13 @@ static void settings_action(void)
     case JIANLU_SETTINGS_ROW_BRIGHTNESS:
         brightness_adjust(1);   // OK 也循环升档
         break;
+    case JIANLU_SETTINGS_ROW_KEEPON:
+        keepon_toggle();
+        break;
     case JIANLU_SETTINGS_ROW_SYNC:
+        if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+            request_job(JOB_PROFILE);   // 顺带拉资料(昵称/头像可能刚改)
+        }
         if (jianlu_capture_queue_count() + s_syncq.count > 0) {
             ESP_LOGI(TAG, "设置页触发立即同步");
             drain_start();
@@ -1094,7 +1113,8 @@ static void on_key_event(const app_ev_t *ev)
             if (s_nav.page == JIANLU_PAGE_HOME) {
                 jianlu_ui_home_focus(s_nav.home_focus);
             } else if (s_nav.page == JIANLU_PAGE_SETTINGS) {
-                jianlu_ui_settings_set(s_nav.settings_focus, s_brightness);
+                jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
+                                       s_keep_on);
             }
             bsp_lvgl_unlock();
         }
@@ -1442,12 +1462,17 @@ static void app_task(void *arg)
         case EV_PROFILE_DONE:
             if ((esp_err_t)ev.arg1 == ESP_OK) {
                 memcpy(&s_profile, &s_profile_tmp, sizeof(s_profile));
-                // 缺缓存才下载(有网进主页/二维码页也会按需刷)
-                if (s_profile.has_avatar && !jianlu_hub_cache_exists(AVATAR_PATH)) {
+                // 缓存跟随 profile 标志失效:有标志就重下(覆盖旧图),
+                // 标志消失就删缓存(避免旧图残留)
+                if (s_profile.has_avatar) {
                     request_job(JOB_AVATAR);
+                } else {
+                    remove(AVATAR_PATH);
                 }
-                if (s_profile.has_qrcode && !jianlu_hub_cache_exists(QRCODE_PATH)) {
+                if (s_profile.has_qrcode) {
                     request_job(JOB_QRCODE);
+                } else {
+                    remove(QRCODE_PATH);
                 }
             }
             if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
@@ -1493,11 +1518,15 @@ void jianlu_app_start(void)
         ESP_LOGW(TAG, "NVS 读取失败,按无凭据处理");
     }
     jianlu_offline_load_syncq(&s_syncq);
-    // 亮度持久化:设置页可调,开机应用
+    // 亮度/常亮持久化:设置页可调,开机应用
     if (s_nvs.brightness == 25 || s_nvs.brightness == 50 ||
         s_nvs.brightness == 75 || s_nvs.brightness == 100) {
         s_brightness = s_nvs.brightness;
         bsp_display_backlight((uint8_t)s_brightness);
+    }
+    if (s_nvs.keep_on) {
+        s_keep_on = true;
+        jianlu_ps_set_keep_on(&s_ps, true);
     }
 
     if (xTaskCreate(app_task, "jianlu", 4096, NULL, 5, NULL) != pdPASS) {

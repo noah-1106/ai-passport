@@ -84,6 +84,9 @@ void jianlu_ui_overlay_hide(void);
 // 短暂提示浮层(1.5s 自动消失,不拦截按键),如"队列已满"。
 void jianlu_ui_overlay_flash(const char *title, uint32_t color_hex, const char *body);
 
+// 「关于」覆盖层:版本文字 + 本地 lv_qrcode 生成的作者主页二维码。
+void jianlu_ui_about(const char *version_text);
+
 // ---- 页面(v2)----
 // 切换页面:主页/简录/二维码/设置。简录页内容由 jianlu_ui_refresh 刷新;
 // 其余页内容用各自的 set 函数。离线标识/电量为全局顶栏。
@@ -98,5 +101,5 @@ void jianlu_ui_home_focus(int focus);   // 0 简录 1 二维码 2 设置
 // 二维码页:available=有缓存图可显示,否则显示引导文案
 void jianlu_ui_qr_set(bool available);
 
-// 设置页:焦点行 + 亮度百分比
-void jianlu_ui_settings_set(int focus, int brightness_pct);
+// 设置页:焦点行 + 亮度百分比 + 常亮开关
+void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on);

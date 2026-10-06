@@ -18,6 +18,7 @@ typedef struct {
     uint32_t idle_s;
     bool screen_on;
     bool busy;
+    bool keep_on;       // 屏幕常亮:不熄屏、不进 light sleep
     bool eat_gesture;   // 正在吞没唤醒手势的后续事件(首事件已吞)
 } jianlu_ps_t;
 
@@ -35,6 +36,9 @@ bool jianlu_ps_key(jianlu_ps_t *ps, bool gesture_end);
 
 // 忙状态切换(录音/上传中禁止休眠)。
 void jianlu_ps_set_busy(jianlu_ps_t *ps, bool busy);
+
+// 屏幕常亮切换:开 = 不熄屏不进 light sleep(立即亮屏);关 = 恢复计时。
+void jianlu_ps_set_keep_on(jianlu_ps_t *ps, bool keep_on);
 
 // light sleep 返回后调用:当作一次唤醒(并吞没唤醒手势)。
 void jianlu_ps_woke(jianlu_ps_t *ps);

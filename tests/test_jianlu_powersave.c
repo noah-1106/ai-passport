@@ -3,7 +3,27 @@
 
 #include "jianlu_powersave.h"
 
+static void test_keep_on(void) {
+    jianlu_ps_t ps;
+    jianlu_ps_init(&ps);
+
+    // 常亮开:再久也不熄屏不睡
+    jianlu_ps_set_keep_on(&ps, true);
+    for (int i = 0; i < JIANLU_PS_LIGHT_SLEEP_S + 30; i++) {
+        assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_NONE);
+    }
+    assert(ps.screen_on && ps.idle_s == 0);
+
+    // 常亮关:恢复计时,60s 熄屏
+    jianlu_ps_set_keep_on(&ps, false);
+    for (int i = 0; i < JIANLU_PS_SCREEN_OFF_S - 1; i++) {
+        assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_NONE);
+    }
+    assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_SCREEN_OFF);
+}
+
 int main(void) {
+    test_keep_on();
     jianlu_ps_t ps;
     jianlu_ps_init(&ps);
     assert(ps.screen_on && ps.idle_s == 0);

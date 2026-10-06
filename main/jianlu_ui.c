@@ -945,12 +945,12 @@ static lv_obj_t *s_home_cells[3];
 static lv_obj_t *s_qr_img;
 static lv_obj_t *s_qr_hint;
 // 设置页部件
-#define SETTINGS_ROWS 4
+#define SETTINGS_ROWS 5
 static lv_obj_t *s_set_rows[SETTINGS_ROWS];
 static lv_obj_t *s_set_vals[SETTINGS_ROWS];
 
 static const char *const SETTING_NAMES[SETTINGS_ROWS] = {
-    "屏幕亮度", "立即同步", "关于", "重新配网",
+    "屏幕亮度", "屏幕常亮", "立即同步", "重新配网", "关于",
 };
 
 static void home_build(lv_obj_t *scr)
@@ -1141,7 +1141,7 @@ void jianlu_ui_qr_set(bool available)
     }
 }
 
-void jianlu_ui_settings_set(int focus, int brightness_pct)
+void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on)
 {
     for (int i = 0; i < SETTINGS_ROWS; i++) {
         lv_obj_set_style_border_width(s_set_rows[i], i == focus ? 2 : 0, 0);
@@ -1150,6 +1150,58 @@ void jianlu_ui_settings_set(int focus, int brightness_pct)
             lv_color_hex(i == focus ? UI_CARD_SEL : UI_CARD), 0);
     }
     lv_label_set_text_fmt(s_set_vals[0], "%d%%", brightness_pct);
+    lv_label_set_text(s_set_vals[1], keep_on ? "开" : "关");
+}
+
+// ---------------------------------------------------------------------------
+// 「关于」覆盖层:版本文字 + lv_qrcode 生成的作者主页二维码(本地生成,
+// 不依赖中枢图片)
+// ---------------------------------------------------------------------------
+static lv_obj_t *s_about_qr;
+static lv_obj_t *s_about_text;
+
+static void about_build(lv_obj_t *parent)
+{
+    s_about_qr = lv_qrcode_create(parent);
+    lv_qrcode_set_size(s_about_qr, 96);
+    lv_qrcode_set_dark_color(s_about_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_about_qr, lv_color_hex(0xFFFFFF));
+    lv_obj_set_pos(s_about_qr, 20, 50);
+    lv_obj_set_style_bg_color(s_about_qr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(s_about_qr, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_about_qr, LV_OBJ_FLAG_HIDDEN);
+
+    s_about_text = text_create(parent, 126, 52, 86, UI_INK);
+    lv_obj_set_height(s_about_text, 90);
+    lv_obj_add_flag(s_about_text, LV_OBJ_FLAG_HIDDEN);
+}
+
+void jianlu_ui_about(const char *version_text)
+{
+    lv_label_set_text(s_voice_title, "关于");
+    lv_obj_set_style_text_color(s_voice_title, lv_color_hex(UI_ACCENT), 0);
+    lv_obj_set_y(s_voice_title, 16);
+
+    lv_qrcode_update(s_about_qr, "https://github.com/noah-1106", 26);
+    lv_obj_remove_flag(s_about_qr, LV_OBJ_FLAG_HIDDEN);
+
+    static char safe[80];
+    sanitize_text(safe, sizeof(safe), version_text);
+    lv_label_set_text(s_about_text, safe);
+    lv_obj_remove_flag(s_about_text, LV_OBJ_FLAG_HIDDEN);
+
+    lv_label_set_text(s_voice_hint, "github.com/noah-1106\nOK 返回");
+    lv_obj_set_y(s_voice_hint, 168);
+    lv_obj_set_height(s_voice_hint, 48);
+    lv_obj_set_style_text_color(s_voice_hint, lv_color_hex(UI_DIM), 0);
+
+    s_wave_active = false;
+    lv_obj_add_flag(s_voice_dot, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < 5; i++) lv_obj_add_flag(s_voice_bars[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_conf_badge, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_conf_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_pager_ind, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_voice_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void battery_tick(lv_timer_t *timer)
@@ -1221,6 +1273,7 @@ void jianlu_ui_create(void)
     settings_build(scr);
 
     voice_build(scr);
+    about_build(s_voice_panel);
     flash_build(scr);
 
     lv_timer_create(wave_tick, 100, NULL);
