@@ -43,6 +43,9 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     data->theme = theme;
     nvs_get_u64(h, "av_ver", &data->avatar_ver);
     nvs_get_u64(h, "qr_ver", &data->qrcode_ver);
+    uint8_t reprov = 0;
+    nvs_get_u8(h, "reprov", &reprov);
+    data->reprov = reprov;
     nvs_close(h);
     return ESP_OK;
 }
@@ -73,6 +76,11 @@ esp_err_t jianlu_nvs_save_keep_on(uint8_t on)
 esp_err_t jianlu_nvs_save_theme(uint8_t theme)
 {
     return nvs_save_u8("theme", theme);
+}
+
+esp_err_t jianlu_nvs_save_reprov(uint8_t on)
+{
+    return nvs_save_u8("reprov", on);
 }
 
 esp_err_t jianlu_nvs_save_image_ver(bool avatar, uint64_t ver)

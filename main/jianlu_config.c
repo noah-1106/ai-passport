@@ -32,3 +32,8 @@ jianlu_dl_action_t jianlu_dl_decide(bool has, uint64_t version, uint64_t last_ve
     if (version != last_version) return JIANLU_DL_NEED;
     return JIANLU_DL_SKIP;
 }
+
+jianlu_fail_view_t jianlu_fetch_fail_view(bool snapshot_ok)
+{
+    return snapshot_ok ? JIANLU_FAIL_OFFLINE : JIANLU_FAIL_ERROR;
+}

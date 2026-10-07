@@ -6,6 +6,7 @@
 #include <sys/time.h>
 
 #include "esp_http_client.h"
+#include "esp_wifi.h"
 #include "esp_log.h"
 #include "jianlu_json.h"
 #include "jianlu_nvs.h"
@@ -23,6 +24,7 @@ static size_t s_body_len;
 static bool s_body_overflow;
 static char s_base[JIANLU_HUB_URL_LEN];
 static char s_resp_date[40];   // 响应 Date 头(对时用)
+static int s_connect_fail_cnt; // TCP 连接失败计数(诊断 PCB/省电问题)
 
 uint8_t *jianlu_net_scratch(size_t *len)
 {
@@ -101,7 +103,13 @@ esp_err_t jianlu_hub_fetch(jianlu_store_t *store, char *errbuf, size_t errbuf_le
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "拉取失败: %s", esp_err_to_name(err));
+        // 诊断:CONNECT 失败时的射频/省电状态(区分 PCB 耗尽 vs 省电超时)
+        wifi_ps_type_t ps = WIFI_PS_NONE;
+        esp_wifi_get_ps(&ps);
+        wifi_ap_record_t ap = { 0 };
+        esp_wifi_sta_get_ap_info(&ap);
+        ESP_LOGW(TAG, "拉取失败: %s(ps=%d rssi=%d 第%d次)",
+                 esp_err_to_name(err), (int)ps, ap.rssi, ++s_connect_fail_cnt);
         set_err(errbuf, errbuf_len,
                 s_body_overflow ? "响应过大" : "连不上中枢");
         return s_body_overflow ? ESP_ERR_INVALID_SIZE : err;

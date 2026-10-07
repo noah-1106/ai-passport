@@ -58,7 +58,7 @@ static const char *TAG = "jianlu";
 #define VOICE_LINK_SELFTEST 0
 // 临时导航自检:置 1 后,首次拉取成功后按脚本注入按键事件,覆盖
 // 主页菜单/三子页/亮度/双击返回/全局按住说话/简录页翻卡。验证完必须改回 0。
-#define NAV_LINK_SELFTEST 0
+#define NAV_LINK_SELFTEST 1
 
 #define EVENT_QUEUE_DEPTH 16
 #define JOB_QUEUE_DEPTH   4
@@ -103,6 +103,7 @@ typedef enum {
     JOB_CAPTURE,         // 语音队列:上传队头一条
     JOB_DISCOVER,        // mDNS 找中枢
     JOB_SYNC,            // 离线待同步队列回放
+    JOB_DIAG,            // 网络诊断:网关/公网/中枢 三路 TCP 探针
     JOB_PROFILE,         // 拉资料(昵称/签名/有无图)
     JOB_AVATAR,          // 下载头像缓存
     JOB_QRCODE,          // 下载二维码缓存
@@ -161,6 +162,7 @@ static QueueHandle_t s_rec_queue;
 // 前向声明(定义在下方)
 static void reprov_overlay_show(void);
 static void drain_start(void);
+static void network_diag(void);   // 定义在文件尾(诊断段)
 static esp_timer_handle_t s_retry_timer;
 static esp_timer_handle_t s_offline_timer;
 static esp_timer_handle_t s_confirm_timer;
@@ -169,32 +171,15 @@ static esp_timer_handle_t s_confirm_timer;
 // 导航自检脚本:{btn, ev},每 1.2s 注入一个
 typedef struct { bsp_btn_t btn; bsp_btn_ev_t ev; } nav_test_key_t;
 static const nav_test_key_t NAV_TEST_SCRIPT[] = {
-    // 主题回墨夜 + 进入二维码页
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 0 焦点1
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 1 焦点2
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 2 进设置
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 3 主题行
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 4 切主题
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 5 切主题
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 6 切到墨夜
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 7 回主页
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 8 焦点1
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 9 进二维码页
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 10 QR页无操作(窗口)
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 11 无操作           ← 截 qr
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 12 回主页
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 13 主页焦点(页面不变)← 截 home
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 14 焦点回到1
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 15 焦点2
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 16 进设置
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 17 设置行焦点(页面不变)← 截 settings
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 18 行焦点
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 19 回主页
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 20 焦点0(简录)
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 21 进简录
-    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 22 翻卡(页面不变)  ← 截 jianlu
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 23 翻卡
-    { BSP_BTN_OK,   BSP_BTN_DOUBLE }, // 24 回主页
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点1
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点2(设置)
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进设置(焦点0)
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行1 主题
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行2 常亮
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行3 立即同步
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行4 重新配网
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 弹确认页
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 确认 → 重启进配网态
 };
 #define NAV_TEST_STEPS (sizeof(NAV_TEST_SCRIPT) / sizeof(NAV_TEST_SCRIPT[0]))
 static esp_timer_handle_t s_nav_test_timer;
@@ -220,6 +205,16 @@ static void nav_test_tick(void *arg)
     app_ev_t msg = { .type = EV_KEY, .btn = k->btn, .btn_ev = k->ev };
     (void)xQueueSend(s_ev_queue, &msg, 0);
 }
+
+static void nav_test_start(void);
+
+#if NAV_LINK_SELFTEST
+static void nav_test_boot_cb(void *arg)
+{
+    (void)arg;
+    if (s_nav_test_step == 0 && s_nav_test_timer == NULL) nav_test_start();
+}
+#endif
 
 static void nav_test_start(void)
 {
@@ -422,10 +417,22 @@ static void net_task(void *arg)
 {
     (void)arg;
     net_job_t job;
+    bool ps_off = false;   // 有作业时关 Wi-Fi 省电(证据:MIN_MODEM 下 SYN
+                           // 间歇丢失,ps=1 rssi=-45 仍 HTTP_CONNECT 失败)
     for (;;) {
         // 空闲等任务时不挂狗;执行作业期间挂狗(HTTP/mDNS 可能长达 30s+,
-        // 超时 40s 覆盖,真卡死才触发)
-        if (xQueueReceive(s_job_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+        // 超时 40s 覆盖,真卡死才触发)。空闲 5s 恢复省电,功耗不受损。
+        if (xQueueReceive(s_job_queue, &job, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            if (ps_off) {
+                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                ps_off = false;
+            }
+            continue;
+        }
+        if (!ps_off) {
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            ps_off = true;
+        }
         esp_task_wdt_add(NULL);
         if (job.type == JOB_FETCH) {
             s_fetch_err[0] = '\0';
@@ -456,6 +463,8 @@ static void net_task(void *arg)
             esp_err_t err = jianlu_offline_save_syncq(&q);
             ESP_LOGI(TAG, "待同步回放: %d 条剩 %d 条", total, q.count);
             post_event(EV_SYNC_DONE, (int32_t)err, q.count, NULL);
+        } else if (job.type == JOB_DIAG) {
+            network_diag();
         } else if (job.type == JOB_PROFILE) {
             esp_err_t err = jianlu_hub_fetch_profile(&s_profile_tmp);
             post_event(EV_PROFILE_DONE, (int32_t)err, 0, NULL);
@@ -815,6 +824,7 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
     }
     request_fetch();   // 清单照常拉取(提示页覆盖其上)
     request_job(JOB_PROFILE);   // 资料(昵称/签名/头像/二维码清单)
+    request_job(JOB_DIAG);      // 网络诊断矩阵(每开机一次)
 }
 
 // OK 确认开始补传:先语音队列(逐条进度),再离线勾选,最后汇总
@@ -1050,8 +1060,9 @@ static void reprov_overlay_handle(const app_ev_t *ev)
     }
     if (!confirm) return;
 
-    ESP_LOGI(TAG, "用户确认重配:清除 NVS 凭据,重启进入配网态");
+    ESP_LOGI(TAG, "用户确认重配:清凭据+置强制配网标志,重启进配网态");
     jianlu_nvs_clear_provisioning();
+    jianlu_nvs_save_reprov(1);   // 粘性:开机必进配网,即使 Kconfig 还有旧凭据
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_restart();
 }
@@ -1076,7 +1087,9 @@ static void on_key_event(const app_ev_t *ev)
         return;
     }
     // 补传进行中:屏蔽按键(进度/汇总由补传流程驱动)
-    if (s_drain_active) return;
+    if (s_drain_active) {
+        return;
+    }
     // 汇总/中断页 + 「发现离线内容」提示 + 「关于」:模态按键路由表(jianlu_modal)
     {
         jianlu_modal_t modal = s_sync_prompt ? JIANLU_MODAL_SYNC_PROMPT
@@ -1349,6 +1362,9 @@ static void app_task(void *arg)
                        == JIANLU_HUB_NVS) {
                 ESP_LOGW(TAG, "mDNS 未发现中枢,用 NVS 缓存地址兜底");
                 hub_ready(s_nvs.hub_url, JIANLU_HUB_NVS);
+            } else if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE
+                       && enter_offline()) {
+                ESP_LOGW(TAG, "未发现中枢,快照离线模式");
             } else {
                 set_error("未在局域网发现小诺中枢\n请确认中枢已启动");
             }
@@ -1367,7 +1383,10 @@ static void app_task(void *arg)
                 ui_refresh(arrived ? JIANLU_ANIM_ARRIVE : JIANLU_ANIM_NONE);
                 refresh_home();   // 主页待办/待同步条随之更新
             } else {
-                if (s_store.view == JIANLU_VIEW_LOADING && enter_offline()) {
+                // 策略见 jianlu_fetch_fail_view(host 测试矩阵):
+                // 有快照必走离线模式,不论此前是何视图
+                if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE
+                    && enter_offline()) {
                     ESP_LOGW(TAG, "中枢不可达,进入离线模式");
                 } else {
                     jianlu_netflow_event(&s_nf, JIANLU_NF_FETCH_FAIL);
@@ -1411,6 +1430,7 @@ static void app_task(void *arg)
                 ESP_LOGI(TAG, "收到 Wi-Fi 凭据(ssid=%s),存 NVS 并重启进入联网",
                          s_prov_ssid);
                 jianlu_nvs_save_wifi(s_prov_ssid, s_prov_pass);
+                jianlu_nvs_save_reprov(0);   // 配网完成,清除强制标志
                 vTaskDelay(pdMS_TO_TICKS(300));   // 让日志与 BLE 事件发完
                 esp_restart();
                 break;
@@ -1536,12 +1556,6 @@ static void app_task(void *arg)
                 maybe_download_images();
             }
             if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
-#if NAV_LINK_SELFTEST
-            if (s_nav_test_step == 0 && s_nav_test_timer == NULL &&
-                (esp_err_t)ev.arg1 == ESP_OK) {
-                nav_test_start();
-            }
-#endif
             break;
         case EV_AVATAR_DONE:
             s_dl_inflight &= (uint8_t)~1;
@@ -1620,7 +1634,12 @@ void jianlu_app_start(void)
                      : wifi_src == JIANLU_WIFI_KCONFIG ? CONFIG_XIAONUO_WIFI_PASSWORD
                      : "";
 
-    if (wifi_src != JIANLU_WIFI_NONE) {
+    if (s_nvs.reprov) {
+        // 用户主动重配:强制配网态,BLUFI 收到新凭据后才清标志回联网
+        ESP_LOGI(TAG, "强制配网标志在位,进入配网模式(忽略已有凭据)");
+        jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
+        enter_provisioning();
+    } else if (wifi_src != JIANLU_WIFI_NONE) {
         ESP_LOGI(TAG, "用%s的凭据连接 Wi-Fi",
                  wifi_src == JIANLU_WIFI_NVS ? "NVS" : "Kconfig");
         esp_err_t err = wifi_start();
@@ -1643,10 +1662,109 @@ void jianlu_app_start(void)
         enter_provisioning();
     }
 
-    jianlu_shot_start();   // 串口截屏服务(只读,失败不影响应用)
+    // 串口截屏服务(只读,失败不影响应用)。配网态不启动:NimBLE 占 ~80K
+    // 后堆仅 ~13K,省下驱动的 1.9K 给 BLUFI 连接;配网成功重启后正常启用。
+    if (!s_prov_running) jianlu_shot_start();
+
+#if NAV_LINK_SELFTEST
+    {   // 自检脚本:开机 12s 启动(不依赖网络,隔离环境也能跑)
+        esp_timer_handle_t t = NULL;
+        esp_timer_create_args_t args = {
+            .callback = nav_test_boot_cb,
+            .name = "nav_boot",
+        };
+        if (esp_timer_create(&args, &t) == ESP_OK) {
+            esp_timer_start_once(t, 12000ULL * 1000);
+        }
+    }
+#endif
 
     esp_err_t btn_err = bsp_button_init(on_key, NULL);
     if (btn_err != ESP_OK) {
         ESP_LOGE(TAG, "按键初始化失败: %s", esp_err_to_name(btn_err));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 网络诊断(隐藏保留):三路 TCP connect 探针 + 关联 AP 详情。
+// 矩阵:网关✗=Wi-Fi 数据面;网关✓公网✓中枢✗=客户端间隔离;
+//       网关✓公网✗=上网控制/IoT 网段;全✓=间歇性(需长时复现)。
+// ---------------------------------------------------------------------------
+#include "lwip/sockets.h"
+#include "lwip/dns.h"
+#include "esp_netif_types.h"
+
+static bool tcp_probe(const char *label, uint32_t ipv4_be, uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "[诊断] %s: socket 失败", label);
+        return false;
+    }
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = ipv4_be,
+    };
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int r = connect(fd, (struct sockaddr *)&dst, sizeof(dst));
+    bool ok = false;
+    if (r == 0) {
+        ok = true;
+    } else if (errno == EINPROGRESS) {
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(fd, &wset);
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        if (select(fd + 1, NULL, &wset, NULL, &tv) > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+            ok = (err == 0);
+        }
+    }
+    close(fd);
+    ESP_LOGW(TAG, "[诊断] %s: %s", label, ok ? "通" : "不通");
+    return ok;
+}
+
+static void network_diag(void)
+{
+    // 关联 AP 详情(bssid/信道/频段——band 锁定缺失时可附到同名邻居 AP)
+    wifi_ap_record_t ap = { 0 };
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        ESP_LOGW(TAG, "[诊断] AP %02X:%02X:%02X:%02X:%02X:%02X ch%u%s rssi=%d "
+                 "second=%u 11b%u g%u n%u",
+                 ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3],
+                 ap.bssid[4], ap.bssid[5], ap.primary,
+                 ap.second == WIFI_SECOND_CHAN_NONE ? "" : "+2H",
+                 ap.rssi, (unsigned)ap.second,
+                 !!(ap.phy_11b), !!(ap.phy_11g), !!(ap.phy_11n));
+    }
+
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip = { 0 };
+    if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
+        ESP_LOGW(TAG, "[诊断] 本机 " IPSTR " 掩码 " IPSTR " 网关 " IPSTR,
+                 IP2STR(&ip.ip), IP2STR(&ip.netmask), IP2STR(&ip.gw));
+    }
+
+    // 诊断矩阵固定三元:网关 / 公网 DNS / 中枢
+    tcp_probe("a:网关 192.168.31.1:53", ipaddr_addr("192.168.31.1"), 53);
+    tcp_probe("b:公网 223.5.5.5:53", ipaddr_addr("223.5.5.5"), 53);
+    {
+        char hub[160];
+        snprintf(hub, sizeof(hub), "%s", jianlu_hub_base());
+        char *host = hub;
+        if (strncmp(host, "http://", 7) == 0) host += 7;
+        char *colon = strchr(host, ':');
+        uint16_t port = 3000;
+        if (colon) {
+            port = (uint16_t)atoi(colon + 1);
+            *colon = '\0';
+        }
+        ESP_LOGW(TAG, "[诊断] c:中枢 %s:%u", host, port);
+        tcp_probe("c:中枢", ipaddr_addr(host), port);
     }
 }

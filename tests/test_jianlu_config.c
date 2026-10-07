@@ -34,5 +34,9 @@ int main(void) {
     assert(jianlu_dl_decide(true, 100, 0, true) == JIANLU_DL_NEED);
     // 版本未变但缓存丢失(被清/损坏):下载
     assert(jianlu_dl_decide(true, 100, 100, false) == JIANLU_DL_NEED);
+
+    // 失败路径视图决策表:有快照→离线模式(内容可见),无快照→错误页
+    assert(jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE);
+    assert(jianlu_fetch_fail_view(false) == JIANLU_FAIL_ERROR);
     return 0;
 }

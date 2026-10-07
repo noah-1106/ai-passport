@@ -25,6 +25,7 @@ typedef struct {
     uint8_t theme;           // 色彩主题 0..3;0=墨夜(默认)
     uint64_t avatar_ver;     // 已缓存头像的中枢版本(0=未缓存)
     uint64_t qrcode_ver;
+    uint8_t reprov;          // 强制配网标志:置位后开机必进配网态(即使有凭据)
 } jianlu_nvs_data_t;
 
 // 读取全部已知 key 到 data(缺失的 key 置空串)。NVS 未初始化返回错误。
@@ -41,3 +42,6 @@ esp_err_t jianlu_nvs_save_image_ver(bool avatar, uint64_t ver);
 
 // 重配:擦除 wifi_ssid/wifi_pass/hub_url 三个 key(其余 NVS 内容不动)。
 esp_err_t jianlu_nvs_clear_provisioning(void);
+// 强制配网标志(重配确认时置 1;BLUFI 收到新凭据时清 0)。
+// 语义:重配 = 强制走配网,即使 Kconfig/NVS 还有旧凭据。
+esp_err_t jianlu_nvs_save_reprov(uint8_t on);

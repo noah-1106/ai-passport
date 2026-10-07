@@ -38,3 +38,13 @@ typedef enum {
 
 jianlu_dl_action_t jianlu_dl_decide(bool has, uint64_t version, uint64_t last_version,
                                     bool cache_exists);
+
+// ---- 失败路径的视图决策(host 可测)----
+// 拉取失败/发现失败:有快照必走离线模式(内容可见+离线标识),
+// 错误信息只在离线模式内提示;无快照才落全屏错误页。
+typedef enum {
+    JIANLU_FAIL_ERROR = 0,   // 无内容可示:错误页
+    JIANLU_FAIL_OFFLINE,     // 有历史快照:离线模式
+} jianlu_fail_view_t;
+
+jianlu_fail_view_t jianlu_fetch_fail_view(bool snapshot_ok);
