@@ -435,7 +435,7 @@ static const char *status_text(const jianlu_store_t *store)
     case JIANLU_VIEW_READY:
     default:
         if (store->count == 0) {
-            if (store->dlink) return "直连模式 · 电脑运行 ble-bridge 同步";
+            if (store->dlink) return "直连模式 · 等待电脑连接";
             return store->offline ? "离线中 · 清单将在联网后加载"
                                   : "全部完成啦";
         }

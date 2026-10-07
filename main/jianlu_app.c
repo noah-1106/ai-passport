@@ -796,7 +796,7 @@ static void settings_action(void)
             int pending = jianlu_capture_queue_count() + s_syncq.count;
             if (bsp_lvgl_lock(500)) {
                 jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
-                                        pending > 0 ? "待同步:电脑运行 ble-bridge"
+                                        pending > 0 ? "等待电脑连接中"
                                                     : "没有待同步内容");
                 bsp_lvgl_unlock();
             }
