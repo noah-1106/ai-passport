@@ -433,7 +433,12 @@ static const char *status_text(const jianlu_store_t *store)
     case JIANLU_VIEW_LOADING:    return "加载简录…";
     case JIANLU_VIEW_ERROR:      return store->error[0] ? store->error : "出错了";
     case JIANLU_VIEW_READY:
-    default:                     return store->count == 0 ? "全部完成啦" : "";
+    default:
+        if (store->count == 0) {
+            return store->offline ? "离线中 · 清单将在联网后加载"
+                                  : "全部完成啦";
+        }
+        return "";
     }
 }
 
@@ -1135,6 +1140,8 @@ void jianlu_ui_home_set(const jianlu_profile_t *prof,
             size_t used = strlen(todo);
             snprintf(todo + used, sizeof(todo) - used, "  %s", model->todo_date);
             lv_label_set_text(s_home_todo, todo);
+        } else if (model->offline_hint) {
+            lv_label_set_text(s_home_todo, "离线 · 稍后自动重试");
         } else {
             lv_label_set_text(s_home_todo, "暂无待办");
         }

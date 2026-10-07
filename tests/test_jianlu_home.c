@@ -48,5 +48,23 @@ int main(void) {
     // 空清单 first_todo 为 NULL
     assert(jianlu_store_first_todo(&s) == NULL);
     assert(jianlu_store_first_todo(NULL) == NULL);
+
+    // 离线降级提示:离线且无待办 → hint(琥珀提示条);在线无待办 → 无 hint
+    jianlu_store_init(&s);
+    s.offline = true;
+    jianlu_home_build(&s, 0, 0, &m);
+    assert(m.offline);
+    assert(!m.has_todo);
+    assert(m.offline_hint);           // 断网×无内容 → 降级提示条
+    fill(&s);
+    jianlu_store_set_voice_placeholders(&s, 2);
+    s.offline = true;
+    jianlu_home_build(&s, 0, 0, &m);
+    assert(m.has_todo);
+    assert(!m.offline_hint);          // 有待办 → 正常显示,不出提示条
+    s.offline = false;
+    jianlu_store_init(&s);
+    jianlu_home_build(&s, 0, 0, &m);
+    assert(!m.offline_hint);          // 在线无待办 → 也不出提示条
     return 0;
 }

@@ -42,4 +42,6 @@ void jianlu_home_build(const jianlu_store_t *store, int pending_sync,
                          strlen(todo->date) >= 10 ? todo->date + 5 : todo->date,
                          sizeof(out->todo_date) - 1);
     }
+    // 离线降级提示:网络在而中枢不可达且当前没有可显示的待办
+    out->offline_hint = out->offline && !out->has_todo;
 }

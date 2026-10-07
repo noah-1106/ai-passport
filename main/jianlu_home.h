@@ -16,6 +16,7 @@ typedef struct {
     bool has_todo;
     char todo_title[JIANLU_TITLE_LEN];
     char todo_date[JIANLU_DATE_LEN];  // 月-日
+    bool offline_hint;   // 离线且无待办:横条显示"离线 · 稍后自动重试"(琥珀)
 } jianlu_home_model_t;
 
 // epoch 为 UTC 秒(0/无效 → time_hhmm 显示 "--:--")。

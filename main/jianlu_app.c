@@ -81,7 +81,6 @@ typedef enum {
     EV_CAPTURE_DONE,     // 网络任务:语音上传结束(arg1=esp_err,arg2=是否 pending 补传)
     EV_PLAY_DONE,        // 录音任务:本地回放结束(arg1=esp_err)
     EV_SYNC_DONE,        // 网络任务:待同步回放结束(arg1=esp_err,arg2=剩余条数)
-    EV_OFFLINE_RETRY,    // 离线模式定时重试拉取
     EV_CONFIRM_TIMEOUT,  // 语音确认页自动关闭
     EV_PROFILE_DONE,     // 网络任务:资料拉取(arg1=esp_err)
     EV_AVATAR_DONE,      // 网络任务:头像下载(arg1=esp_err)
@@ -165,8 +164,7 @@ static QueueHandle_t s_rec_queue;
 static void reprov_overlay_show(void);
 static void drain_start(void);
 static void network_diag(void);   // 定义在文件尾(诊断段)
-static esp_timer_handle_t s_retry_timer;
-static esp_timer_handle_t s_offline_timer;
+static esp_timer_handle_t s_retry_timer;   // 仅 Wi-Fi 关联层重连(非业务同步)
 static esp_timer_handle_t s_confirm_timer;
 
 #if NAV_LINK_SELFTEST
@@ -511,15 +509,11 @@ static void apply_view(jianlu_anim_t anim)
     ui_refresh(anim);
 }
 
-static void offline_retry_timer_ensure(void);   // 定义在 enter_offline 前
-
 static void set_error(const char *msg)
 {
     s_nf = JIANLU_NF_ERROR;
     jianlu_store_set_view(&s_store, JIANLU_VIEW_ERROR, msg);
     ui_refresh(JIANLU_ANIM_NONE);
-    // 无快照的联网失败落在错误页:同样周期重试,恢复后自动回在线
-    offline_retry_timer_ensure();
 }
 
 static void request_fetch(void)
@@ -742,10 +736,16 @@ static void settings_action(void)
             drain_start();
         } else {
             if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
-                request_fetch();
+                request_fetch();   // 用户手动触发的重试(离线时的主入口)
             }
             if (bsp_lvgl_lock(500)) {
-                jianlu_ui_overlay_flash("已是最新", jianlu_ui_accent(), "没有待同步内容");
+                if (s_store.offline) {
+                    jianlu_ui_overlay_flash("离线中", jianlu_ui_accent(),
+                                            "正在尝试重新连接");
+                } else {
+                    jianlu_ui_overlay_flash("已是最新", jianlu_ui_accent(),
+                                            "没有待同步内容");
+                }
                 bsp_lvgl_unlock();
             }
         }
@@ -901,12 +901,6 @@ static void drain_abort_show(void)
     }
 }
 
-static void offline_retry_cb(void *arg)
-{
-    (void)arg;
-    post_event(EV_OFFLINE_RETRY, 0, 0, NULL);
-}
-
 // 队列录音 ⇄ 清单顶部占位卡(每条一卡,可单独回放)同步;
 // 标题带录音时刻(已对时)或"待同步"(未对时)
 static void sync_voice_placeholder(void)
@@ -928,38 +922,26 @@ static void sync_voice_placeholder(void)
     }
 }
 
-// 30s 周期重试定时器(幂等):离线模式与错误页共用,恢复后自动回在线
-static void offline_retry_timer_ensure(void)
-{
-    if (s_offline_timer) {
-        esp_timer_start_periodic(s_offline_timer, 30000ULL * 1000);
-        return;
-    }
-    esp_timer_create_args_t args = {
-        .callback = offline_retry_cb,
-        .name = "offline_retry",
-    };
-    if (esp_timer_create(&args, &s_offline_timer) == ESP_OK) {
-        esp_timer_start_periodic(s_offline_timer, 30000ULL * 1000);
-    }
-}
-
-// 进入离线模式(快照可用时):装快照、定期重试;无快照返回 false
+// 进入离线模式:有快照装快照,无快照显示空态——都是正常界面(READY+离线
+// 标识),绝不整屏错误页。离线期间不做任何后台重试:同步只由用户动作触发
+// (设置页"立即同步"、进入简录页拉取、回主页刷资料、Wi-Fi 重新拿 IP)。
 static bool enter_offline(void)
 {
-    if (!jianlu_offline_load_snapshot(&s_store)) return false;
+    if (!jianlu_offline_load_snapshot(&s_store)) {
+        // 无快照降级:空清单 + 离线标识(简录页空态文案由 offline 驱动)
+        memset(&s_store, 0, sizeof(s_store));
+        jianlu_store_set_view(&s_store, JIANLU_VIEW_READY, NULL);
+        s_store.offline = true;
+    }
     sync_voice_placeholder();
     s_nf = JIANLU_NF_READY;
     ui_refresh(JIANLU_ANIM_NONE);
-    if (s_offline_timer) esp_timer_stop(s_offline_timer);
-    offline_retry_timer_ensure();
     return true;
 }
 
 static void leave_offline(void)
 {
     s_store.offline = false;
-    if (s_offline_timer) esp_timer_stop(s_offline_timer);
 }
 
 // GOT_IP:停 BLUFI、按优先级确定中枢
@@ -1367,16 +1349,21 @@ static void app_task(void *arg)
                     // 开机 10 分钟内禁止(刚配完就被要求再配是荒谬的;
                     // uptime 起点即配网成功后的重启点)
                     && (esp_timer_get_time() / 1000LL) > 600LL * 1000LL;
-                if (may_auto_reprov && !enter_offline()) {
-                    // 无快照可示且凭据类失败:才转配网
-                    ESP_LOGW(TAG, "凭据类连接失败且无快照,转入配网态");
-                    // 配网/联网分离:先释放 Wi-Fi 的 ~56KB,BLUFI 才有地方住
-                    wifi_teardown();
-                    enter_provisioning();
-                } else {
-                    if (may_auto_reprov) {
-                        ESP_LOGW(TAG, "连接屡败但快照在位,保持离线等路由器恢复");
+                if (may_auto_reprov) {
+                    // 静态探针(栈放不下 ~5KB 的 store 结构)
+                    static jianlu_store_t probe;
+                    bool has_content = jianlu_offline_load_snapshot(&probe);
+                    if (has_content) {
+                        // 有历史内容:保持可用界面,离线降级继续重试
+                        enter_offline();
+                        ESP_LOGW(TAG, "凭据类失败但有快照,离线降级继续重试");
+                    } else {
+                        // 凭据类失败且无任何可示内容:转配网(用户重新配置)
+                        ESP_LOGW(TAG, "凭据类失败且无快照,转入配网态");
+                        wifi_teardown();
+                        enter_provisioning();
                     }
+                } else {
                     schedule_wifi_retry();
                 }
             }
@@ -1388,9 +1375,9 @@ static void app_task(void *arg)
                        == JIANLU_HUB_NVS) {
                 ESP_LOGW(TAG, "mDNS 未发现中枢,用 NVS 缓存地址兜底");
                 hub_ready(s_nvs.hub_url, JIANLU_HUB_NVS);
-            } else if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE
-                       && enter_offline()) {
-                ESP_LOGW(TAG, "未发现中枢,快照离线模式");
+            } else if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE) {
+                enter_offline();
+                ESP_LOGW(TAG, "未发现中枢,离线降级(正常界面)");
             } else {
                 set_error("未在局域网发现小诺中枢\n请确认中枢已启动");
             }
@@ -1409,16 +1396,18 @@ static void app_task(void *arg)
                 ui_refresh(arrived ? JIANLU_ANIM_ARRIVE : JIANLU_ANIM_NONE);
                 refresh_home();   // 主页待办/待同步条随之更新
             } else {
-                // 策略见 jianlu_fetch_fail_view(host 测试矩阵):
-                // 有快照必走离线模式,不论此前是何视图
-                if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE
-                    && enter_offline()) {
-                    ESP_LOGW(TAG, "中枢不可达,进入离线模式");
+                // 正常界面内降级:Wi-Fi 在而中枢不可达,一律离线模式
+                // (有快照显示快照,无快照空态),不论此前是何视图。
+                // 全屏错误页只保留给 Wi-Fi 初始化失败。
+                if (jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE) {
+                    enter_offline();
+                    ESP_LOGW(TAG, "中枢不可达,离线降级(正常界面)");
                 } else {
                     jianlu_netflow_event(&s_nf, JIANLU_NF_FETCH_FAIL);
                     jianlu_store_set_view(&s_store, JIANLU_VIEW_ERROR, s_fetch_err);
                     ui_refresh(JIANLU_ANIM_NONE);
                 }
+                refresh_home();
             }
             break;
         case EV_COMPLETE_DONE:
@@ -1572,14 +1561,7 @@ static void app_task(void *arg)
             }
             refresh_home();
             break;
-        case EV_OFFLINE_RETRY:
-            // 离线模式与错误页(无快照的联网失败)都持续重试,
-            // 恢复后自动回在线——错误页绝不成为死端
-            if ((s_store.offline || s_store.view == JIANLU_VIEW_ERROR)
-                && s_wifi_connected && jianlu_hub_base()[0] != '\0') {
-                request_fetch();
-            }
-            break;
+
         case EV_CONFIRM_TIMEOUT:
             voice_dismiss();
             break;

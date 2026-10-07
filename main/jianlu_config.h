@@ -40,14 +40,15 @@ jianlu_dl_action_t jianlu_dl_decide(bool has, uint64_t version, uint64_t last_ve
                                     bool cache_exists);
 
 // ---- 失败路径的视图决策(host 可测)----
-// 拉取失败/发现失败:有快照必走离线模式(内容可见+离线标识),
-// 错误信息只在离线模式内提示;无快照才落全屏错误页。
+// 正常界面内降级:拉取失败一律进离线/降级模式(READY+离线标识,
+// 有快照显示快照,无快照显示空态),绝不整屏接管。
+// 全屏错误页只保留给真正致命状态:Wi-Fi 初始化失败(无凭据走配网,另路径)。
 typedef enum {
-    JIANLU_FAIL_ERROR = 0,   // 无内容可示:错误页
-    JIANLU_FAIL_OFFLINE,     // 有历史快照:离线模式
+    JIANLU_FAIL_ERROR = 0,   // Wi-Fi 本身不可用:错误页(仅此一种)
+    JIANLU_FAIL_OFFLINE,     // 网络在而中枢不可达:正常界面+离线降级
 } jianlu_fail_view_t;
 
-jianlu_fail_view_t jianlu_fetch_fail_view(bool snapshot_ok);
+jianlu_fail_view_t jianlu_fetch_fail_view(bool wifi_ok);
 
 // Wi-Fi 断开原因是否为"凭据/关联类失败"(连不上 AP)。
 // 只有这类失败才允许自动转配网;beacon 超时/路由器重启等临时原因绝不触发。
