@@ -27,3 +27,9 @@ jianlu_auto_action_t jianlu_auto_decide(const jianlu_auto_input_t *in)
     }
     return JIANLU_AUTO_STAY;
 }
+
+jianlu_sync_act_t jianlu_dlink_sync_decide(bool dlink_mode, bool ble_connected)
+{
+    if (!dlink_mode) return JIANLU_SYNC_WIFI;
+    return ble_connected ? JIANLU_SYNC_REQ_BLE : JIANLU_SYNC_WAIT_BLE;
+}

@@ -77,10 +77,22 @@ static void test_ble_stay_and_exit(void) {
     assert(jianlu_auto_decide(&in) == JIANLU_AUTO_STAY);
 }
 
+
+static void test_sync_decide(void)
+{
+    // 设置页「立即同步」直连态决策:直连开时无论凭据/驻留,只看桥连接
+    assert(jianlu_dlink_sync_decide(true, true) == JIANLU_SYNC_REQ_BLE);
+    assert(jianlu_dlink_sync_decide(true, false) == JIANLU_SYNC_WAIT_BLE);
+    // 非直连:一律原 Wi-Fi 路径(连接与否无关)
+    assert(jianlu_dlink_sync_decide(false, true) == JIANLU_SYNC_WIFI);
+    assert(jianlu_dlink_sync_decide(false, false) == JIANLU_SYNC_WIFI);
+}
+
 int main(void) {
     test_null_and_busy();
     test_dwell_debounce();
     test_wifi_to_ble();
     test_ble_stay_and_exit();
+    test_sync_decide();
     return 0;
 }

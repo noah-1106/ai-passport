@@ -16,6 +16,10 @@ bool jianlu_dlink_start(void);
 // 是否已有 BLE 中央(桥)连接
 bool jianlu_dlink_connected(void);
 
+// 向已连接的中心(电脑桥)发一行(自动 MTU 分片,行尾补 '\n')。
+// 返回 false = 未连接/未订阅/组包失败。短行专用(≤126 字节)。
+bool jianlu_dlink_send_line(const char *line);
+
 // ---- 应用接线(直连态清单刷新由 BLE 命令驱动)----
 void jianlu_dlink_bind(jianlu_store_t *store, void (*refresh)(void));
 void jianlu_dlink_set_pending(const char (*ids)[JIANLU_ID_LEN], int n);

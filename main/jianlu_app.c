@@ -791,17 +791,36 @@ static void settings_action(void)
         keepon_toggle();
         break;
     case JIANLU_SETTINGS_ROW_SYNC:
-        if (s_dlink_mode) {
-            // 直连态无 Wi-Fi:同步由电脑端桥完成,这里只提示
-            int pending = jianlu_capture_queue_count() + s_syncq.count;
+        switch (jianlu_dlink_sync_decide(s_dlink_mode, jianlu_dlink_connected())) {
+        case JIANLU_SYNC_REQ_BLE:
+            // 直连 + 桥已连接:请电脑跑一轮同步(records/plist/语音槽)
+            if (jianlu_dlink_send_line("{\"c\":\"sync\"}")) {
+                ESP_LOGI(TAG, "已请求电脑同步(直连)");
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_flash("已请求电脑同步", jianlu_ui_accent(),
+                                            "电脑正在拉取待同步内容");
+                    bsp_lvgl_unlock();
+                }
+            } else {
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_flash("发送失败", jianlu_ui_accent(),
+                                            "连接刚断开,请稍后再试");
+                    bsp_lvgl_unlock();
+                }
+            }
+            break;
+        case JIANLU_SYNC_WAIT_BLE:
+            // 直连 + 未连接:同步由电脑端桥完成,这里只提示
             if (bsp_lvgl_lock(500)) {
                 jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
-                                        pending > 0 ? "等待电脑连接中"
-                                                    : "没有待同步内容");
+                                        "等待电脑连接中");
                 bsp_lvgl_unlock();
             }
             break;
+        default:
+            break;   // Wi-Fi 态:走下面原路径
         }
+        if (s_dlink_mode) break;
         if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
             request_job(JOB_PROFILE);   // 顺带拉资料(昵称/头像可能刚改)
         }

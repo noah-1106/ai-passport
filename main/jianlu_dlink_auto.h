@@ -35,3 +35,14 @@ typedef struct {
 } jianlu_auto_input_t;
 
 jianlu_auto_action_t jianlu_auto_decide(const jianlu_auto_input_t *in);
+
+// 设置页「立即同步」的行为决策(纯 C,host 可测)。
+// 直连 + 桥已连接 → 向中心发 sync 请求;直连未连接 → 提示等待电脑;
+// 非直连 → 原 Wi-Fi 路径(调用方自行处理)。
+typedef enum {
+    JIANLU_SYNC_WIFI = 0,   // 非直连:原 Wi-Fi 路径
+    JIANLU_SYNC_REQ_BLE,    // 直连 + 桥已连接:向中心发 {"c":"sync"}
+    JIANLU_SYNC_WAIT_BLE,   // 直连 + 未连接:提示等待电脑连接
+} jianlu_sync_act_t;
+
+jianlu_sync_act_t jianlu_dlink_sync_decide(bool dlink_mode, bool ble_connected);

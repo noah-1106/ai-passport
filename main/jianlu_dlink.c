@@ -488,3 +488,12 @@ bool jianlu_dlink_connected(void)
 {
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
 }
+
+bool jianlu_dlink_send_line(const char *line)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_tx_subscribed) return false;
+    char out[128];
+    int n = snprintf(out, sizeof(out), "%s\n", line);
+    if (n <= 0 || (size_t)n >= sizeof(out)) return false;
+    return send_line_ex(out);
+}
