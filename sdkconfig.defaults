@@ -68,6 +68,9 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
 # AMPDU RX 聚合窗保持默认 6:实测压到 2 省不了多少堆(底仍 ~11K),
 # 却勒死聚合吞吐(96KB 语音上传 ESP_ERR_HTTP_CONNECT 超时)。
 # CONFIG_ESP_WIFI_RX_BA_WIN=6
+# AMPDU TX 聚合关闭:TX 聚合缓冲占运行期堆;关掉给"音频 DMA 开机预占 +
+# 联网态堆底 ≥12K"腾预算。上传为小流量流式,单帧发送吞吐足够。
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 
 # 「关于」页:本地 lv_qrcode 生成作者主页二维码。
 CONFIG_LV_USE_QRCODE=y
@@ -79,3 +82,5 @@ CONFIG_LV_FS_POSIX_PATH=""
 # TCP MSL 60s→15s(TIME_WAIT 120s→30s):同步/刷新的突发短连接不再长时间
 # 占用 PCB 池(间歇性 HTTP_CONNECT 失败的次因保险)。
 CONFIG_LWIP_TCP_MSL=15000
+# TCP PCB 池加大:默认 5 条连接,开机序列(诊断3+拉取2)即占满,后续全部连接失败
+CONFIG_LWIP_MAX_ACTIVE_TCP=16

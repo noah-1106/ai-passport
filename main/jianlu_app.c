@@ -154,6 +154,7 @@ static bool s_info_shown;               // 「关于」信息页显示中
 #define AVATAR_PATH "/voicefs/avatar.raw"
 #define QRCODE_PATH "/voicefs/qrcode.raw"
 static bool s_prov_running;
+static bool s_diag_done;           // 诊断矩阵本启动周期已跑过
 static bool s_reprov_confirm;        // 重配确认页显示中
 static bool s_screen_off;            // 背光已熄(省电)
 static QueueHandle_t s_ev_queue;
@@ -347,6 +348,12 @@ static esp_err_t wifi_start(void)
     if (err != ESP_OK) return err;
     err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err != ESP_OK) return err;
+    // 联网期间永久关闭 Wi-Fi 省电:小米路由器对省电客户端(MIN_MODEM)的
+    // 单播/ARP 投递有已知缺陷,进入过省电后该客户端流量间歇丢失
+    // (SYN 发不出→HTTP_CONNECT 超时,曾实测 ps=1 rssi=-45 仍失败)。
+    // 熄屏与深睡仍省电;射频功耗增加可接受(屏幕才是大头)。
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) return err;
     err = esp_wifi_start();
     if (err != ESP_OK) return err;
 
@@ -421,21 +428,11 @@ static void net_task(void *arg)
 {
     (void)arg;
     net_job_t job;
-    bool ps_off = false;   // 有作业时关 Wi-Fi 省电(证据:MIN_MODEM 下 SYN
-                           // 间歇丢失,ps=1 rssi=-45 仍 HTTP_CONNECT 失败)
     for (;;) {
         // 空闲等任务时不挂狗;执行作业期间挂狗(HTTP/mDNS 可能长达 30s+,
         // 超时 40s 覆盖,真卡死才触发)。空闲 5s 恢复省电,功耗不受损。
         if (xQueueReceive(s_job_queue, &job, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            if (ps_off) {
-                esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                ps_off = false;
-            }
-            continue;
-        }
-        if (!ps_off) {
-            esp_wifi_set_ps(WIFI_PS_NONE);
-            ps_off = true;
+            continue;   // 不再恢复省电:见 wifi_start 处注释(小米+省电=投递bug)
         }
         esp_task_wdt_add(NULL);
         if (job.type == JOB_FETCH) {
@@ -834,7 +831,7 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
     }
     request_fetch();   // 清单照常拉取(提示页覆盖其上)
     request_job(JOB_PROFILE);   // 资料(昵称/签名/头像/二维码清单)
-    request_job(JOB_DIAG);      // 网络诊断矩阵(每开机一次)
+    // 诊断矩阵改为按需:不再开机必跑(3 条探针连接曾耗尽 PCB 池,见 EV_FETCH_DONE)
 }
 
 // OK 确认开始补传:先语音队列(逐条进度),再离线勾选,最后汇总
@@ -951,12 +948,7 @@ static void on_got_ip(void)
     stop_provisioning();
     jianlu_netflow_event(&s_nf, JIANLU_NF_GOT_IP);
     apply_view(JIANLU_ANIM_NONE);
-    ESP_LOGI(TAG, "堆: got_ip 时 %u", (unsigned)esp_get_free_heap_size());
-    // 趁堆宽裕先把音频 I2S DMA 拿下(首次录音再分配可能失败)
-    if (jianlu_capture_prepare_audio() != ESP_OK) {
-        ESP_LOGW(TAG, "音频初始化失败,语音记录将不可用");
-    }
-    ESP_LOGI(TAG, "堆: 音频后 %u", (unsigned)esp_get_free_heap_size());
+ESP_LOGI(TAG, "堆: got_ip(音频已预占) %u", (unsigned)esp_get_free_heap_size());
     if (!ensure_worker_tasks()) {
         set_error("系统资源不足");
         return;
@@ -1383,6 +1375,10 @@ static void app_task(void *arg)
             }
             break;
         case EV_FETCH_DONE:
+            if ((esp_err_t)ev.arg1 != ESP_OK && !s_diag_done) {
+                s_diag_done = true;
+                request_job(JOB_DIAG);   // 拉取失败后按需诊断一次(帮助定位网络层)
+            }
             // 网络任务已直接更新 s_store(期间 s_fetch_busy 挡住了读方)
             if ((esp_err_t)ev.arg1 == ESP_OK) {
                 jianlu_netflow_event(&s_nf, JIANLU_NF_FETCH_OK);
@@ -1655,6 +1651,13 @@ void jianlu_app_start(void)
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
         enter_provisioning();
     } else if (wifi_src != JIANLU_WIFI_NONE) {
+        // 音频 I2S DMA 必须在 Wi-Fi 之前预占:Wi-Fi 运行后 17K 空闲堆的
+        // DMA 最大连续块只剩 6.9K(实测),录音时再分配必失败;开机(80K+)必成功。
+        // 代价是联网态堆底 -8K,由 AMPDU TX 关闭(CONFIG)补偿。
+        if (jianlu_capture_prepare_audio() != ESP_OK) {
+            ESP_LOGW(TAG, "音频预占失败,语音记录将不可用");
+        }
+        ESP_LOGI(TAG, "堆: 音频预占后 %u", (unsigned)esp_get_free_heap_size());
         ESP_LOGI(TAG, "用%s的凭据连接 Wi-Fi",
                  wifi_src == JIANLU_WIFI_NVS ? "NVS" : "Kconfig");
         esp_err_t err = wifi_start();

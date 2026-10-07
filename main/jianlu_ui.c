@@ -1239,6 +1239,12 @@ static lv_obj_t *s_about_text;
 
 static void about_build(lv_obj_t *parent)
 {
+    (void)parent;   // 二维码画布懒创建(见 jianlu_ui_about),缓解 LVGL 池压力
+}
+
+static void about_qr_ensure(lv_obj_t *parent)
+{
+    if (s_about_qr != NULL) return;
     s_about_qr = lv_qrcode_create(parent);
     lv_qrcode_set_size(s_about_qr, 96);
     lv_qrcode_set_dark_color(s_about_qr, lv_color_hex(0x000000));
@@ -1255,6 +1261,7 @@ static void about_build(lv_obj_t *parent)
 
 void jianlu_ui_about(const char *version_text)
 {
+    about_qr_ensure(s_voice_panel);   // 懒创建画布(打开关于页才有)
     lv_label_set_text(s_voice_title, "关于");
     lv_obj_set_style_text_color(s_voice_title, lv_color_hex(UI_ACCENT), 0);
     lv_obj_set_y(s_voice_title, 16);

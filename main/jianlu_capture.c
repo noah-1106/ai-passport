@@ -18,9 +18,10 @@
 
 static const char *TAG = "jianlu_cap";
 
+
 #define HTTP_CHUNK   2048          // 上传分块
 #define RESP_SIZE    (4 * 1024)    // capture 响应缓冲(transcript+reply+records)
-#define CAPTURE_TIMEOUT_MS 30000   // ASR+LLM 在服务端,给足余量
+#define CAPTURE_TIMEOUT_MS 60000   // ASR+LLM 在服务端,环境音识别可超 30s,给足
 #define QUEUE_LOW_KB 96            // 分区剩余低于此值视为队列满(约 3s 录音余量)
 #define OLD_PENDING_PATH "/voicefs/pending.wav"
 

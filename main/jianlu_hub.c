@@ -16,14 +16,16 @@ static const char *TAG = "jianlu_hub";
 
 // 9KB 静态缓冲:12 条记录(标题 96B + 摘要 128B + JSON 开销)正常 <7KB。
 // 不走堆,避免和 Wi-Fi/LVGL 抢碎片;也是全网络任务的共享刮擦区。
-#define HUB_BODY_SIZE (9 * 1024)
+#define HUB_BODY_SIZE (6 * 1024)
 #define HUB_TIMEOUT_MS 8000
 
 static char s_body[HUB_BODY_SIZE];
 static size_t s_body_len;
 static bool s_body_overflow;
 static char s_base[JIANLU_HUB_URL_LEN];
-static char s_resp_date[40];   // 响应 Date 头(对时用)
+static char s_resp_date[40];
+
+   // 响应 Date 头(对时用)
 static int s_connect_fail_cnt; // TCP 连接失败计数(诊断 PCB/省电问题)
 
 uint8_t *jianlu_net_scratch(size_t *len)
