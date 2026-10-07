@@ -15,6 +15,19 @@ typedef enum {
     JIANLU_WIFI_KCONFIG,
 } jianlu_wifi_src_t;
 
+// 启动模式决策(优先级:直连 > 强制配网 > 凭据联网 > 出厂配网)。
+// 直连(BLE-only)不需要 Wi-Fi 凭据:dmode 在位时无论凭据/重配状态
+// 一律进 BLE,配网页只属于"Wi-Fi 模式且无凭据"。
+typedef enum {
+    JIANLU_BOOT_BLE = 0,     // dmode 直连标志在位:BLE 广播,跳过一切 Wi-Fi 逻辑
+    JIANLU_BOOT_PROV_FORCE,  // reprov 标志在位:用户要求重配,强制配网态
+    JIANLU_BOOT_WIFI,        // 有凭据(NVS/Kconfig):正常联网路径
+    JIANLU_BOOT_PROV_FRESH,  // 无凭据:出厂配网模式
+} jianlu_boot_mode_t;
+
+jianlu_boot_mode_t jianlu_config_boot_mode(bool dmode, bool reprov,
+                                           jianlu_wifi_src_t wifi_src);
+
 typedef enum {
     JIANLU_HUB_NONE = 0,
     JIANLU_HUB_KCONFIG,

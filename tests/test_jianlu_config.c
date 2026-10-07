@@ -40,6 +40,30 @@ int main(void) {
     assert(jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE);
     assert(jianlu_fetch_fail_view(false) == JIANLU_FAIL_ERROR);
 
+    // 启动模式决策矩阵:直连标志 × 凭据状态 × 重配标志
+    // 直连开:无论凭据如何、甚至带着重配标志,都进 BLE(配网页绝不出现)
+    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_BLE);
+    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_KCONFIG)
+           == JIANLU_BOOT_BLE);
+    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_BLE);
+    assert(jianlu_config_boot_mode(true, true, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_BLE);
+    assert(jianlu_config_boot_mode(true, true, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_BLE);
+    // 直连关:重配标志 > 凭据联网 > 出厂配网
+    assert(jianlu_config_boot_mode(false, true, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_PROV_FORCE);
+    assert(jianlu_config_boot_mode(false, true, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_PROV_FORCE);
+    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_WIFI);
+    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_KCONFIG)
+           == JIANLU_BOOT_WIFI);
+    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_PROV_FRESH);
+
     // Wi-Fi 断开原因分类:只有凭据/关联类失败才允许自动转配网
     assert(jianlu_wifi_reason_is_cred_error(15));    // 4-way 握手超时
     assert(jianlu_wifi_reason_is_cred_error(201));   // 找不到 AP

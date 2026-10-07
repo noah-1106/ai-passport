@@ -435,6 +435,7 @@ static const char *status_text(const jianlu_store_t *store)
     case JIANLU_VIEW_READY:
     default:
         if (store->count == 0) {
+            if (store->dlink) return "直连模式 · 电脑运行 ble-bridge 同步";
             return store->offline ? "离线中 · 清单将在联网后加载"
                                   : "全部完成啦";
         }
@@ -1433,8 +1434,16 @@ void jianlu_ui_refresh(const jianlu_store_t *store, jianlu_anim_t anim)
                           store->view == JIANLU_VIEW_READY ? ""
                                                            : status_text(store));
     }
-    if (store->offline && store->view == JIANLU_VIEW_READY) {
-        lv_obj_remove_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
+    if (store->view == JIANLU_VIEW_READY) {
+        if (store->dlink) {
+            lv_label_set_text(s_offline, "直连");
+            lv_obj_remove_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
+        } else if (store->offline) {
+            lv_label_set_text(s_offline, "离线");
+            lv_obj_remove_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
         lv_obj_add_flag(s_offline, LV_OBJ_FLAG_HIDDEN);
     }

@@ -58,6 +58,7 @@ typedef struct {
     int selected;             // 0..count-1;count==0 时无意义
     jianlu_view_t view;
     bool offline;             // 离线模式:清单来自本地快照,操作只记待同步
+    bool dlink;               // BLE 直连模式:常驻直连标识(不入快照,同 offline)
     char error[JIANLU_ERROR_LEN];
 } jianlu_store_t;
 

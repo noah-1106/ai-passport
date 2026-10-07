@@ -15,6 +15,15 @@ jianlu_wifi_src_t jianlu_config_pick_wifi(const char *nvs_ssid, const char *kcon
     return JIANLU_WIFI_NONE;
 }
 
+jianlu_boot_mode_t jianlu_config_boot_mode(bool dmode, bool reprov,
+                                           jianlu_wifi_src_t wifi_src)
+{
+    if (dmode) return JIANLU_BOOT_BLE;          // 直连优先于一切 Wi-Fi 逻辑
+    if (reprov) return JIANLU_BOOT_PROV_FORCE;
+    if (wifi_src != JIANLU_WIFI_NONE) return JIANLU_BOOT_WIFI;
+    return JIANLU_BOOT_PROV_FRESH;
+}
+
 jianlu_hub_src_t jianlu_config_pick_hub(const char *kconf_url, const char *mdns_url,
                                         const char *nvs_url)
 {

@@ -1233,6 +1233,15 @@ static void on_key_event(const app_ev_t *ev)
     }
 
     if (ev->btn == BSP_BTN_UP && ev->btn_ev == BSP_BTN_LONG) {
+        if (s_dlink_mode) {
+            // 直连态无 Wi-Fi 凭据概念:重配无意义,只提示(不清直连标志)
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
+                                        "无需配网:关闭直连后可用");
+                bsp_lvgl_unlock();
+            }
+            return;
+        }
         reprov_overlay_show();   // 重配入口(任意视图可用)
         return;
     }
@@ -1831,7 +1840,9 @@ void jianlu_app_start(void)
         return;
     }
 
-    // 凭据优先级:NVS > Kconfig;都没有 → 出厂配网模式
+    // 启动模式决策(纯函数,host 测试矩阵覆盖):直连 > 强制配网 > 凭据联网
+    // > 出厂配网。直连(BLE-only)不需要 Wi-Fi 凭据——dmode 在位时无论凭据
+    // 状态一律进 BLE,配网页只属于"Wi-Fi 模式且无凭据"。
     jianlu_wifi_src_t wifi_src = jianlu_config_pick_wifi(s_nvs.wifi_ssid,
                                                          CONFIG_XIAONUO_WIFI_SSID);
     const char *ssid = wifi_src == JIANLU_WIFI_NVS ? s_nvs.wifi_ssid
@@ -1841,7 +1852,8 @@ void jianlu_app_start(void)
                      : wifi_src == JIANLU_WIFI_KCONFIG ? CONFIG_XIAONUO_WIFI_PASSWORD
                      : "";
 
-    if (s_nvs.dmode) {
+    switch (jianlu_config_boot_mode(s_nvs.dmode, s_nvs.reprov, wifi_src)) {
+    case JIANLU_BOOT_BLE: {
         // BLE 直连模式:与 Wi-Fi 互斥(内存),起 NUS 服务端;
         // 设置页「直连模式」再按一次回 Wi-Fi(重启切换)。
         // 注意:NimBLE 全量初始化吃 ~74K(音频 DMA 8K + 网络/录音任务 9K
@@ -1849,19 +1861,25 @@ void jianlu_app_start(void)
         // 语音槽由 Wi-Fi 态录制、直连态由桥 vget 拉取(voicefs 持久)。
         ESP_LOGI(TAG, "BLE 直连模式");
         s_dlink_mode = true;
-        jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
+        s_store.dlink = true;   // 常驻直连标识(不借用配网态视图)
+        // 不走 netflow NO_CREDS:那会把视图切成配网页。直连态就是正常
+        // 界面(空清单 + 「直连」标识),清单由桥推送到达。
+        jianlu_store_set_view(&s_store, JIANLU_VIEW_READY, NULL);
         jianlu_dlink_bind(&s_store, dlink_ui_refresh_cb);
         jianlu_dlink_set_pdone_cb(dlink_pdone_cb);
         jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
         jianlu_dlink_start();
         ESP_LOGI(TAG, "堆: 直连就绪后 %u", (unsigned)esp_get_free_heap_size());
-        apply_view(JIANLU_ANIM_NONE);
-    } else if (s_nvs.reprov) {
+        ui_refresh(JIANLU_ANIM_NONE);
+        break;
+    }
+    case JIANLU_BOOT_PROV_FORCE:
         // 用户主动重配:强制配网态,BLUFI 收到新凭据后才清标志回联网
         ESP_LOGI(TAG, "强制配网标志在位,进入配网模式(忽略已有凭据)");
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
         enter_provisioning();
-    } else if (wifi_src != JIANLU_WIFI_NONE) {
+        break;
+    case JIANLU_BOOT_WIFI: {
         // 音频 I2S DMA 必须在 Wi-Fi 之前预占:Wi-Fi 运行后 17K 空闲堆的
         // DMA 最大连续块只剩 6.9K(实测),录音时再分配必失败;开机(80K+)必成功。
         // 代价是联网态堆底 -8K,由 AMPDU TX 关闭(CONFIG)补偿。
@@ -1883,12 +1901,15 @@ void jianlu_app_start(void)
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_WITH_CREDS);
         apply_view(JIANLU_ANIM_NONE);
         wifi_connect();
-    } else {
+        break;
+    }
+    default:
         // 配网/联网分离(无 PSRAM,Wi-Fi ~56KB 与 NimBLE ~40KB 无法共存):
         // 配网态完全不起 Wi-Fi,BLUFI 收到凭据存 NVS 后重启走联网路径。
         ESP_LOGI(TAG, "无 Wi-Fi 凭据,进入配网模式");
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
         enter_provisioning();
+        break;
     }
 
     // 串口截屏服务(只读,失败不影响应用)。配网态不启动:NimBLE 占 ~80K
