@@ -973,12 +973,12 @@ static lv_obj_t *s_qr_hint;
 static lv_obj_t *s_qr_guide;
 static lv_obj_t *s_qr_nick;
 // 设置页部件
-#define SETTINGS_ROWS 6
+#define SETTINGS_ROWS 7
 static lv_obj_t *s_set_rows[SETTINGS_ROWS];
 static lv_obj_t *s_set_vals[SETTINGS_ROWS];
 
 static const char *const SETTING_NAMES[SETTINGS_ROWS] = {
-    "屏幕亮度", "色彩主题", "屏幕常亮", "立即同步", "重新配网", "关于",
+    "屏幕亮度", "色彩主题", "屏幕常亮", "直连模式", "立即同步", "重新配网", "关于",
 };
 
 static void home_build(lv_obj_t *scr)
@@ -1217,7 +1217,7 @@ void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof)
 }
 
 void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
-                            int theme_id)
+                            int theme_id, bool dlink_on)
 {
     for (int i = 0; i < SETTINGS_ROWS; i++) {
         lv_obj_set_style_border_width(s_set_rows[i], i == focus ? 2 : 0, 0);
@@ -1228,6 +1228,7 @@ void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
     lv_label_set_text_fmt(s_set_vals[0], "%d%%", brightness_pct);
     lv_label_set_text(s_set_vals[1], jianlu_theme_name(theme_id));
     lv_label_set_text(s_set_vals[2], keep_on ? "开" : "关");
+    lv_label_set_text(s_set_vals[3], dlink_on ? "开" : "关");
 }
 
 // ---------------------------------------------------------------------------

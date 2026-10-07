@@ -26,6 +26,8 @@ typedef struct {
     uint64_t avatar_ver;     // 已缓存头像的中枢版本(0=未缓存)
     uint64_t qrcode_ver;
     uint8_t reprov;          // 强制配网标志:置位后开机必进配网态(即使有凭据)
+    uint8_t dmode;           // BLE 直连模式:置位后开机不起 Wi-Fi,起 NUS 服务
+    uint8_t dlock;           // 手动强制 BLE 常驻(自动退出被禁止)
 } jianlu_nvs_data_t;
 
 // 读取全部已知 key 到 data(缺失的 key 置空串)。NVS 未初始化返回错误。
@@ -45,6 +47,9 @@ esp_err_t jianlu_nvs_clear_provisioning(void);
 // 强制配网标志(重配确认时置 1;BLUFI 收到新凭据时清 0)。
 // 语义:重配 = 强制走配网,即使 Kconfig/NVS 还有旧凭据。
 esp_err_t jianlu_nvs_save_reprov(uint8_t on);
+// BLE 直连模式标志(设置页切换,重启生效)
+esp_err_t jianlu_nvs_save_dmode(uint8_t on);
+esp_err_t jianlu_nvs_save_dlock(uint8_t on);
 
 // 配网成功落盘:凭据写入 + 强制标志清除,同一事务(单次 commit)。
 // 修复"两笔独立提交间掉电/失败 → 有凭据但标志在位 → 永远强制配网"。

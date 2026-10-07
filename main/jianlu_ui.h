@@ -106,7 +106,7 @@ void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof);
 
 // 设置页:焦点行 + 亮度百分比 + 常亮开关 + 当前主题名
 void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
-                            int theme_id);
+                            int theme_id, bool dlink_on);
 
 // ---- 色彩主题 ----
 int jianlu_ui_theme(void);              // 当前主题 id

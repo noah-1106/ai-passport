@@ -46,6 +46,12 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     uint8_t reprov = 0;
     nvs_get_u8(h, "reprov", &reprov);
     data->reprov = reprov;
+    uint8_t dmode = 0;
+    nvs_get_u8(h, "dmode", &dmode);
+    data->dmode = dmode;
+    uint8_t dlock = 0;
+    nvs_get_u8(h, "dlock", &dlock);
+    data->dlock = dlock;
     nvs_close(h);
     return ESP_OK;
 }
@@ -81,6 +87,16 @@ esp_err_t jianlu_nvs_save_theme(uint8_t theme)
 esp_err_t jianlu_nvs_save_reprov(uint8_t on)
 {
     return nvs_save_u8("reprov", on);
+}
+
+esp_err_t jianlu_nvs_save_dmode(uint8_t on)
+{
+    return nvs_save_u8("dmode", on);
+}
+
+esp_err_t jianlu_nvs_save_dlock(uint8_t on)
+{
+    return nvs_save_u8("dlock", on);
 }
 
 esp_err_t jianlu_nvs_save_provisioned(const char *ssid, const char *pass)

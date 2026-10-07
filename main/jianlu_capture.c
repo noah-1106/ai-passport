@@ -21,7 +21,9 @@ static const char *TAG = "jianlu_cap";
 
 #define HTTP_CHUNK   2048          // 上传分块
 #define RESP_SIZE    (4 * 1024)    // capture 响应缓冲(transcript+reply+records)
-#define CAPTURE_TIMEOUT_MS 60000   // ASR+LLM 在服务端,环境音识别可超 30s,给足
+#define CAPTURE_TIMEOUT_MS 35000   // 必须小于 TWDT(40s):中枢成黑洞时
+                                   // connect/write 各阻塞一个超时周期,
+                                   // 60s 会把 jianlu_net 直接打成看门狗重启循环
 #define QUEUE_LOW_KB 96            // 分区剩余低于此值视为队列满(约 3s 录音余量)
 #define OLD_PENDING_PATH "/voicefs/pending.wav"
 
@@ -385,6 +387,7 @@ esp_err_t jianlu_capture_upload_head(jianlu_capture_result_t *result)
     if (err == ESP_OK) {
         size_t sent = 0;
         while (sent < (size_t)fsize) {
+            esp_task_wdt_reset();   // 每块喂狗:黑洞链路上单块可顶满超时
             size_t want = (size_t)fsize - sent;
             if (want > HTTP_CHUNK) want = HTTP_CHUNK;
             size_t got = fread(scratch, 1, want, f);

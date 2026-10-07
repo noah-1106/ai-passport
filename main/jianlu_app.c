@@ -27,6 +27,11 @@
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include "lwip/sockets.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -45,6 +50,8 @@
 #include "jianlu_powersave.h"
 #include "jianlu_provision.h"
 #include "jianlu_shot.h"
+#include "jianlu_dlink.h"
+#include "jianlu_dlink_auto.h"
 #include "jianlu_theme.h"
 #include "jianlu_timefmt.h"
 #include "jianlu_tone.h"
@@ -82,6 +89,9 @@ typedef enum {
     EV_PLAY_DONE,        // 录音任务:本地回放结束(arg1=esp_err)
     EV_SYNC_DONE,        // 网络任务:待同步回放结束(arg1=esp_err,arg2=剩余条数)
     EV_CONFIRM_TIMEOUT,  // 语音确认页自动关闭
+    EV_AUTO_TICK,        // 自动切换决策节拍(15s)
+    EV_DLINK_REFRESH,    // BLE 桥推完清单:刷新简录页/主页
+    EV_DLINK_PDONE,      // BLE 桥确认勾选已同步(id 在 payload)
     EV_PROFILE_DONE,     // 网络任务:资料拉取(arg1=esp_err)
     EV_AVATAR_DONE,      // 网络任务:头像下载(arg1=esp_err)
     EV_QR_DONE,          // 网络任务:二维码下载(arg1=esp_err)
@@ -103,6 +113,7 @@ typedef enum {
     JOB_DISCOVER,        // mDNS 找中枢
     JOB_SYNC,            // 离线待同步队列回放
     JOB_DIAG,            // 网络诊断:网关/公网/中枢 三路 TCP 探针
+    JOB_HUBPING,         // 自动切换用的中枢可达探测(单次 TCP connect)
     JOB_PROFILE,         // 拉资料(昵称/签名/有无图)
     JOB_AVATAR,          // 下载头像缓存
     JOB_QRCODE,          // 下载二维码缓存
@@ -150,6 +161,12 @@ static jianlu_profile_t s_profile_tmp;  // 网络任务写,EV_PROFILE_DONE 时�
 static int s_brightness = 100;          // 25/50/75/100
 static bool s_keep_on;                  // 屏幕常亮
 static bool s_info_shown;               // 「关于」信息页显示中
+static bool s_dlink_mode;               // 当前运行于 BLE 直连模式
+static bool s_dlink_locked;             // 手动强制 BLE 常驻
+// 自动切换观测量
+static uint32_t s_hub_unreachable_s;    // Wi-Fi 态:中枢连续不可达秒数
+static uint32_t s_ble_idle_s;           // BLE 态:桥未连接秒数
+static esp_timer_handle_t s_auto_timer;
 
 #define AVATAR_PATH "/voicefs/avatar.raw"
 #define QRCODE_PATH "/voicefs/qrcode.raw"
@@ -172,15 +189,13 @@ static esp_timer_handle_t s_confirm_timer;
 // 导航自检脚本:{btn, ev},每 1.2s 注入一个
 typedef struct { bsp_btn_t btn; bsp_btn_ev_t ev; } nav_test_key_t;
 static const nav_test_key_t NAV_TEST_SCRIPT[] = {
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点1
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 焦点2(设置)
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 进设置(焦点0)
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行1 主题
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行2 常亮
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行3 立即同步
-    { BSP_BTN_DOWN, BSP_BTN_CLICK },  // 行4 重新配网
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 弹确认页
-    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 确认 → 重启进配网态
+    { BSP_BTN_UP,   BSP_BTN_CLICK },  // 等待窗口(桥 #1 推清单需要 ~90s)
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },
+    { BSP_BTN_UP,   BSP_BTN_CLICK },
+    { BSP_BTN_DOWN, BSP_BTN_CLICK },
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 主页焦点0=简录 → 进简录页
+    { BSP_BTN_OK,   BSP_BTN_CLICK },  // 勾选顶卡(直连态:入待同步,桥 plist 上报)
+    { BSP_BTN_OK,   BSP_BTN_LONG  },  // 长按 OK:录音(自检构建固定 3s,入槽待 vget)
 };
 #define NAV_TEST_STEPS (sizeof(NAV_TEST_SCRIPT) / sizeof(NAV_TEST_SCRIPT[0]))
 static esp_timer_handle_t s_nav_test_timer;
@@ -464,6 +479,42 @@ static void net_task(void *arg)
             esp_err_t err = jianlu_offline_save_syncq(&q);
             ESP_LOGI(TAG, "待同步回放: %d 条剩 %d 条", total, q.count);
             post_event(EV_SYNC_DONE, (int32_t)err, q.count, NULL);
+        } else if (job.type == JOB_HUBPING) {
+            // 基础设施探测:只测 TCP 可达,无业务请求
+            if (jianlu_hub_base()[0] != '\0') {
+                char host[128];
+                snprintf(host, sizeof(host), "%s", jianlu_hub_base());
+                char *h = host;
+                if (strncmp(h, "http://", 7) == 0) h += 7;
+                char *colon = strchr(h, ':');
+                uint16_t port = 3000;
+                if (colon) { port = (uint16_t)atoi(colon + 1); *colon = '\0'; }
+                int fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (fd >= 0) {
+                    struct sockaddr_in dst = {
+                        .sin_family = AF_INET,
+                        .sin_port = htons(port),
+                        .sin_addr.s_addr = ipaddr_addr(h),
+                    };
+                    int fl = fcntl(fd, F_GETFL, 0);
+                    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+                    int r = connect(fd, (struct sockaddr *)&dst, sizeof(dst));
+                    bool ok = false;
+                    if (r == 0) ok = true;
+                    else if (errno == EINPROGRESS) {
+                        fd_set ws; FD_ZERO(&ws); FD_SET(fd, &ws);
+                        struct timeval tv = { .tv_sec = 5 };
+                        if (select(fd + 1, NULL, &ws, NULL, &tv) > 0) {
+                            int soerr = 0; socklen_t sl = sizeof(soerr);
+                            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+                            ok = (soerr == 0);
+                        }
+                    }
+                    close(fd);
+                    if (ok) s_hub_unreachable_s = 0;
+                    else s_hub_unreachable_s += 30;
+                }
+            }
         } else if (job.type == JOB_DIAG) {
             network_diag();
         } else if (job.type == JOB_PROFILE) {
@@ -542,6 +593,7 @@ static void request_discover(void)
 // 图片缓存统一决策:版本变了/缓存缺失才下载;中枢已无此图则删缓存清版本。
 // EV_PROFILE_DONE 与进入二维码页共用,保证"不换图秒进"。
 static void request_job(job_type_t type);   // 前向声明(定义在下方)
+static void auto_switch(jianlu_auto_action_t act);
 
 // 在途标记:下载进行中不再重复排队(进二维码页与 profile 到达可能撞车)
 static uint8_t s_dl_inflight;   // bit0=avatar bit1=qrcode
@@ -624,7 +676,7 @@ static void switch_page(void)
     case JIANLU_PAGE_SETTINGS:
         if (bsp_lvgl_lock(500)) {
             jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
-                                   s_keep_on, jianlu_ui_theme());
+                                   s_keep_on, jianlu_ui_theme(), s_dlink_mode);
             bsp_lvgl_unlock();
         }
         break;
@@ -651,7 +703,7 @@ static void settings_refresh(void)
 {
     if (s_nav.page == JIANLU_PAGE_SETTINGS && bsp_lvgl_lock(500)) {
         jianlu_ui_settings_set(s_nav.settings_focus, s_brightness, s_keep_on,
-                               jianlu_ui_theme());
+                               jianlu_ui_theme(), s_dlink_mode);
         bsp_lvgl_unlock();
     }
 }
@@ -721,10 +773,35 @@ static void settings_action(void)
         ESP_LOGI(TAG, "色彩主题: %s", jianlu_theme_name(next));
         break;
     }
+    case JIANLU_SETTINGS_ROW_DLINK:
+        // 手动开 = 强制 BLE 常驻(dlock);再按 = 两者全清回 Wi-Fi 自动
+        if (s_dlink_mode) {
+            jianlu_nvs_save_dmode(0);
+            jianlu_nvs_save_dlock(0);
+            ESP_LOGI(TAG, "直连关闭,重启回 Wi-Fi 模式");
+        } else {
+            jianlu_nvs_save_dmode(1);
+            jianlu_nvs_save_dlock(1);
+            ESP_LOGI(TAG, "直连开启(强制 BLE 常驻),重启生效");
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+        break;
     case JIANLU_SETTINGS_ROW_KEEPON:
         keepon_toggle();
         break;
     case JIANLU_SETTINGS_ROW_SYNC:
+        if (s_dlink_mode) {
+            // 直连态无 Wi-Fi:同步由电脑端桥完成,这里只提示
+            int pending = jianlu_capture_queue_count() + s_syncq.count;
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
+                                        pending > 0 ? "待同步:电脑运行 ble-bridge"
+                                                    : "没有待同步内容");
+                bsp_lvgl_unlock();
+            }
+            break;
+        }
         if (s_wifi_connected && jianlu_hub_base()[0] != '\0') {
             request_job(JOB_PROFILE);   // 顺带拉资料(昵称/头像可能刚改)
         }
@@ -837,6 +914,7 @@ static void hub_ready(const char *url, jianlu_hub_src_t src)
 // OK 确认开始补传:先语音队列(逐条进度),再离线勾选,最后汇总
 static void drain_start(void)
 {
+    if (!s_job_queue) return;   // 直连/配网态无网络任务,防 NULL 队列
     s_sync_prompt = false;
     s_drain_active = true;
     s_drain_done = 0;
@@ -1191,7 +1269,7 @@ static void on_key_event(const app_ev_t *ev)
                 jianlu_ui_home_focus(s_nav.home_focus);
             } else if (s_nav.page == JIANLU_PAGE_SETTINGS) {
                 jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
-                                       s_keep_on, jianlu_ui_theme());
+                                       s_keep_on, jianlu_ui_theme(), s_dlink_mode);
             }
             bsp_lvgl_unlock();
         }
@@ -1233,12 +1311,15 @@ static void on_key_event(const app_ev_t *ev)
         if (rec->completing || rec->sync_pending) return;
         char id[JIANLU_ID_LEN];
         jianlu_utf8_copy(id, sizeof(id), rec->id, sizeof(id) - 1);
-        if (s_store.offline) {
-            // 离线勾选:记待同步队列,联网后批量 PUT(last-write-wins)
+        if (s_store.offline || s_dlink_mode) {
+            // 离线/直连勾选:记待同步队列,联网后批量 PUT / 直连由桥 plist 上报
             jianlu_store_set_completing(&s_store, id, false);
             jianlu_store_set_sync_pending(&s_store, id, true);
             jianlu_syncq_add(&s_syncq, id);
             jianlu_offline_save_syncq(&s_syncq);
+            if (s_dlink_mode) {
+                jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
+            }
             ESP_LOGI(TAG, "离线勾选 id=%s,待同步 %d 条", id, s_syncq.count);
             ui_refresh(JIANLU_ANIM_NONE);
             return;
@@ -1280,6 +1361,91 @@ static void light_sleep_once(void)
     ui_refresh(JIANLU_ANIM_NONE);
 }
 
+static void auto_tick_cb(void *arg)
+{
+    (void)arg;
+    post_event(EV_AUTO_TICK, 0, 0, NULL);
+}
+
+// 周期节拍:累计观测量 → 决策 → 必要时切换(Wi-Fi 态附带中枢探测)
+// ---- BLE 直连接线回调(NimBLE 主机任务上下文,只投事件)----
+static void dlink_ui_refresh_cb(void)
+{
+    post_event(EV_DLINK_REFRESH, 0, 0, NULL);
+}
+
+static void dlink_pdone_cb(const char *id)
+{
+    post_event(EV_DLINK_PDONE, 0, 0, id);
+}
+
+static void on_auto_tick(void)
+{
+    static int tick_n;
+    tick_n++;
+
+    bool busy = s_voice.state != JIANLU_VOICE_IDLE || s_drain_active ||
+                s_playing || s_prov_running;
+
+    if (s_dlink_mode) {
+        if (jianlu_dlink_connected()) {
+            s_ble_idle_s = 0;
+        } else {
+            s_ble_idle_s += 15;
+        }
+        jianlu_auto_input_t in = {
+            .in_ble = true,
+            .ble_locked = s_dlink_locked,
+            .ble_connected = jianlu_dlink_connected(),
+            .wifi_has_creds = s_nvs.wifi_ssid[0] != '\0',
+            .busy = busy,
+            .mode_dwell_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            .ble_idle_s = s_ble_idle_s,
+        };
+        auto_switch(jianlu_auto_decide(&in));
+    } else if (s_wifi_connected) {
+        // Wi-Fi 态:每 30s 一次中枢探测(基础设施探测,非业务同步)
+        if (tick_n % 2 == 1 && s_job_queue) {
+            net_job_t job = { .type = JOB_HUBPING };
+            (void)xQueueSend(s_job_queue, &job, 0);
+        }
+        jianlu_auto_input_t in = {
+            .in_ble = false,
+            .ble_locked = s_dlink_locked,
+            .wifi_has_creds = s_nvs.wifi_ssid[0] != '\0',
+            .busy = busy,
+            .mode_dwell_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            .hub_unreachable_s = s_hub_unreachable_s,
+        };
+        auto_switch(jianlu_auto_decide(&in));
+    }
+}
+
+static void auto_switch(jianlu_auto_action_t act)
+{
+    if (act == JIANLU_AUTO_TO_BLE) {
+        ESP_LOGW(TAG, "中枢持续不可达,自动切换 BLE 直连");
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_flash("切换直连", jianlu_ui_accent(),
+                                    "正在转 BLE 模式");
+            bsp_lvgl_unlock();
+        }
+        jianlu_nvs_save_dmode(1);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+    } else if (act == JIANLU_AUTO_TO_WIFI) {
+        ESP_LOGW(TAG, "BLE 空闲超时,自动回 Wi-Fi 试探");
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_flash("切换 Wi-Fi", jianlu_ui_accent(),
+                                    "正在转 Wi-Fi 模式");
+            bsp_lvgl_unlock();
+        }
+        jianlu_nvs_save_dmode(0);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+    }
+}
+
 static void app_task(void *arg)
 {
     (void)arg;
@@ -1288,8 +1454,11 @@ static void app_task(void *arg)
     for (;;) {
         esp_task_wdt_reset();
         // 省电:忙(录音/上传/配网/回放)不累计空闲
+        // 直连模式常置忙:light sleep 会杀 BLE 广播/连接(USB 也随之中断),
+        // 熄屏不受影响;Wi-Fi 模式保持原有休眠策略
         jianlu_ps_set_busy(&s_ps,
-            s_voice.state != JIANLU_VOICE_IDLE || s_prov_running || s_playing);
+            s_voice.state != JIANLU_VOICE_IDLE || s_prov_running || s_playing ||
+            s_dlink_mode);
         if (xQueueReceive(s_ev_queue, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) {
             switch (jianlu_ps_tick(&s_ps)) {
             case JIANLU_PS_ACT_SCREEN_OFF:
@@ -1561,6 +1730,28 @@ static void app_task(void *arg)
         case EV_CONFIRM_TIMEOUT:
             voice_dismiss();
             break;
+        case EV_AUTO_TICK:
+            on_auto_tick();
+            break;
+        case EV_DLINK_REFRESH:
+            // BLE 桥推完整套清单(store 已被直连任务更新):刷简录页与主页
+            jianlu_store_set_view(&s_store, JIANLU_VIEW_READY, NULL);
+            sync_voice_placeholder();
+            ui_refresh(JIANLU_ANIM_NONE);
+            refresh_home();
+            break;
+        case EV_DLINK_PDONE:
+            // 桥已把该勾选 PUT 成功:出队持久化 + 顶卡飞出(同 EV_COMPLETE_DONE 成功路径)
+            jianlu_syncq_remove(&s_syncq, ev.id);
+            jianlu_offline_save_syncq(&s_syncq);
+            jianlu_tone_play(JIANLU_TONE_COMPLETE);
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_success_flash();
+                bsp_lvgl_unlock();
+            }
+            jianlu_store_remove(&s_store, ev.id);
+            ui_refresh(JIANLU_ANIM_COMPLETE);
+            break;
         case EV_PROFILE_DONE:
             if ((esp_err_t)ev.arg1 == ESP_OK) {
                 memcpy(&s_profile, &s_profile_tmp, sizeof(s_profile));
@@ -1625,8 +1816,13 @@ void jianlu_app_start(void)
         jianlu_ps_set_keep_on(&s_ps, true);
     }
     if (s_nvs.theme != 0) {
-        // 开机恢复持久化主题(非默认才切换,省一次重建)
-        jianlu_ui_set_theme(s_nvs.theme);
+        // 开机恢复持久化主题(非默认才切换,省一次重建)。
+        // 重建 = 删旧屏建新屏,必须持 LVGL 锁(无锁与渲染任务并发
+        // 会损坏 LVGL 池元数据 → TLSF 崩溃;BLE 模式实测触发)
+        if (bsp_lvgl_lock(2000)) {
+            jianlu_ui_set_theme(s_nvs.theme);
+            bsp_lvgl_unlock();
+        }
         ESP_LOGI(TAG, "主题(持久化): %s", jianlu_theme_name(s_nvs.theme));
     }
 
@@ -1645,7 +1841,22 @@ void jianlu_app_start(void)
                      : wifi_src == JIANLU_WIFI_KCONFIG ? CONFIG_XIAONUO_WIFI_PASSWORD
                      : "";
 
-    if (s_nvs.reprov) {
+    if (s_nvs.dmode) {
+        // BLE 直连模式:与 Wi-Fi 互斥(内存),起 NUS 服务端;
+        // 设置页「直连模式」再按一次回 Wi-Fi(重启切换)。
+        // 注意:NimBLE 全量初始化吃 ~74K(音频 DMA 8K + 网络/录音任务 9K
+        // 放不进来,实测任务创建失败/互斥量断言),直连态不做语音录音,
+        // 语音槽由 Wi-Fi 态录制、直连态由桥 vget 拉取(voicefs 持久)。
+        ESP_LOGI(TAG, "BLE 直连模式");
+        s_dlink_mode = true;
+        jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
+        jianlu_dlink_bind(&s_store, dlink_ui_refresh_cb);
+        jianlu_dlink_set_pdone_cb(dlink_pdone_cb);
+        jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
+        jianlu_dlink_start();
+        ESP_LOGI(TAG, "堆: 直连就绪后 %u", (unsigned)esp_get_free_heap_size());
+        apply_view(JIANLU_ANIM_NONE);
+    } else if (s_nvs.reprov) {
         // 用户主动重配:强制配网态,BLUFI 收到新凭据后才清标志回联网
         ESP_LOGI(TAG, "强制配网标志在位,进入配网模式(忽略已有凭据)");
         jianlu_netflow_event(&s_nf, JIANLU_NF_START_NO_CREDS);
@@ -1682,7 +1893,19 @@ void jianlu_app_start(void)
 
     // 串口截屏服务(只读,失败不影响应用)。配网态不启动:NimBLE 占 ~80K
     // 后堆仅 ~13K,省下驱动的 1.9K 给 BLUFI 连接;配网成功重启后正常启用。
-    if (!s_prov_running) jianlu_shot_start();
+    if (!s_prov_running && !s_dlink_mode) jianlu_shot_start();
+
+    // 自动切换决策节拍(15s 周期):纯本地计时,累计观测量交事件循环决策;
+    // Wi-Fi 态的中枢探测也由它按需投 JOB_HUBPING,业务层仍无自主网络动作。
+    {
+        esp_timer_create_args_t args = {
+            .callback = auto_tick_cb,
+            .name = "auto_tick",
+        };
+        if (esp_timer_create(&args, &s_auto_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_auto_timer, 15ULL * 1000000);
+        }
+    }
 
 #if NAV_LINK_SELFTEST
     {   // 自检脚本:开机 12s 启动(不依赖网络,隔离环境也能跑)

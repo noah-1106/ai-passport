@@ -46,16 +46,16 @@ int main(void) {
     assert(nav.page == JIANLU_PAGE_SETTINGS);
     assert(nav.settings_focus == 0);
 
-    // 设置页:UP/DOWN 移焦点(六行循环:亮度/主题/常亮/同步/重配/关于),OK = 动作
-    for (int i = 1; i <= 5; i++) {
+    // 设置页:UP/DOWN 移焦点(七行循环:亮度/主题/常亮/直连/同步/重配/关于)
+    for (int i = 1; i <= 6; i++) {
         assert(jianlu_nav_key(&nav, DOWN, CLICK) == JIANLU_NAV_FOCUS_CHANGED);
         assert(nav.settings_focus == i);
     }
-    assert(nav.settings_focus == 5);   // 关于(最后一项)
+    assert(nav.settings_focus == 6);   // 关于(最后一项)
     assert(jianlu_nav_key(&nav, DOWN, CLICK) == JIANLU_NAV_FOCUS_CHANGED);
     assert(nav.settings_focus == 0);   // 循环
     assert(jianlu_nav_key(&nav, UP, CLICK) == JIANLU_NAV_FOCUS_CHANGED);
-    assert(nav.settings_focus == 5);
+    assert(nav.settings_focus == 6);
 
     // OK 在设置页 = 动作
     assert(jianlu_nav_key(&nav, OK, CLICK) == JIANLU_NAV_SETTINGS_ACTION);
