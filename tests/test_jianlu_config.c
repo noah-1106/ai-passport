@@ -38,5 +38,16 @@ int main(void) {
     // 失败路径视图决策表:有快照→离线模式(内容可见),无快照→错误页
     assert(jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE);
     assert(jianlu_fetch_fail_view(false) == JIANLU_FAIL_ERROR);
+
+    // Wi-Fi 断开原因分类:只有凭据/关联类失败才允许自动转配网
+    assert(jianlu_wifi_reason_is_cred_error(15));    // 4-way 握手超时
+    assert(jianlu_wifi_reason_is_cred_error(201));   // 找不到 AP
+    assert(jianlu_wifi_reason_is_cred_error(202));   // 认证失败
+    assert(jianlu_wifi_reason_is_cred_error(203));   // 关联失败
+    assert(jianlu_wifi_reason_is_cred_error(204));   // 握手超时
+    assert(jianlu_wifi_reason_is_cred_error(205));   // 连接失败(密码错)
+    assert(!jianlu_wifi_reason_is_cred_error(200));  // beacon 超时(临时)
+    assert(!jianlu_wifi_reason_is_cred_error(2));    // AP 内部原因
+    assert(!jianlu_wifi_reason_is_cred_error(8));    // 正常挥手断开
     return 0;
 }

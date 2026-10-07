@@ -58,7 +58,7 @@ static const char *TAG = "jianlu";
 #define VOICE_LINK_SELFTEST 0
 // 临时导航自检:置 1 后,首次拉取成功后按脚本注入按键事件,覆盖
 // 主页菜单/三子页/亮度/双击返回/全局按住说话/简录页翻卡。验证完必须改回 0。
-#define NAV_LINK_SELFTEST 1
+#define NAV_LINK_SELFTEST 0
 
 #define EVENT_QUEUE_DEPTH 16
 #define JOB_QUEUE_DEPTH   4
@@ -132,6 +132,8 @@ static jianlu_syncq_t s_syncq;
 static jianlu_ps_t s_ps;
 static char s_mdns_url[JIANLU_HUB_URL_LEN];
 static int s_connect_fails;
+static bool s_ever_got_ip;       // 本次启动是否成功拿到过 IP(拿到过绝不自动重配)
+static int s_last_disc_reason;   // 最近一次断开原因(自动重配判定用)
 static char s_prev_top_id[JIANLU_ID_LEN];
 // 显式同步:提示页 → OK 逐条上传(进度)→ 汇总页
 static bool s_sync_prompt;       // 「发现离线内容」提示页显示中
@@ -303,9 +305,13 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (cfg.sta.ssid[0] != '\0') wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected = false;
+        wifi_event_sta_disconnected_t *disc =
+            (wifi_event_sta_disconnected_t *)data;
+        s_last_disc_reason = disc ? disc->reason : 0;
         post_event(EV_WIFI_DISCONNECTED, 0, 0, NULL);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_wifi_connected = true;
+        s_ever_got_ip = true;   // 一旦联网成功,本启动内绝不再自动重配
         post_event(EV_WIFI_CONNECTED, 0, 0, NULL);
     }
 }
@@ -505,11 +511,15 @@ static void apply_view(jianlu_anim_t anim)
     ui_refresh(anim);
 }
 
+static void offline_retry_timer_ensure(void);   // 定义在 enter_offline 前
+
 static void set_error(const char *msg)
 {
     s_nf = JIANLU_NF_ERROR;
     jianlu_store_set_view(&s_store, JIANLU_VIEW_ERROR, msg);
     ui_refresh(JIANLU_ANIM_NONE);
+    // 无快照的联网失败落在错误页:同样周期重试,恢复后自动回在线
+    offline_retry_timer_ensure();
 }
 
 static void request_fetch(void)
@@ -918,6 +928,22 @@ static void sync_voice_placeholder(void)
     }
 }
 
+// 30s 周期重试定时器(幂等):离线模式与错误页共用,恢复后自动回在线
+static void offline_retry_timer_ensure(void)
+{
+    if (s_offline_timer) {
+        esp_timer_start_periodic(s_offline_timer, 30000ULL * 1000);
+        return;
+    }
+    esp_timer_create_args_t args = {
+        .callback = offline_retry_cb,
+        .name = "offline_retry",
+    };
+    if (esp_timer_create(&args, &s_offline_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_offline_timer, 30000ULL * 1000);
+    }
+}
+
 // 进入离线模式(快照可用时):装快照、定期重试;无快照返回 false
 static bool enter_offline(void)
 {
@@ -925,15 +951,8 @@ static bool enter_offline(void)
     sync_voice_placeholder();
     s_nf = JIANLU_NF_READY;
     ui_refresh(JIANLU_ANIM_NONE);
-    if (!s_offline_timer) {
-        esp_timer_create_args_t args = {
-            .callback = offline_retry_cb,
-            .name = "offline_retry",
-        };
-        if (esp_timer_create(&args, &s_offline_timer) != ESP_OK) return true;
-    }
-    esp_timer_stop(s_offline_timer);
-    esp_timer_start_periodic(s_offline_timer, 30000ULL * 1000);
+    if (s_offline_timer) esp_timer_stop(s_offline_timer);
+    offline_retry_timer_ensure();
     return true;
 }
 
@@ -1337,20 +1356,27 @@ static void app_task(void *arg)
                 break;   // 配网态下 BLUFI 主导连接,不重试
             } else {
                 s_connect_fails++;
-                ESP_LOGW(TAG, "连接失败 %d/%d", s_connect_fails, WIFI_FAIL_TO_PROVISION);
-                if (s_connect_fails >= WIFI_FAIL_TO_PROVISION) {
-                    if (enter_offline()) {
-                        // 有快照:路由器可能只是暂时不在,留离线模式并继续后台重连,
-                        // 而不是逼用户重配(重配只在没有快照可用时发生)
-                        ESP_LOGW(TAG, "连接屡败,有本地快照,进入离线模式");
-                        schedule_wifi_retry();
-                    } else if (jianlu_netflow_event(&s_nf, JIANLU_NF_CONNECT_FAIL)) {
-                        ESP_LOGW(TAG, "连接屡败(凭据可能失效),转入配网态");
-                        // 配网/联网分离:先释放 Wi-Fi 的 ~56KB,BLUFI 才有地方住
-                        wifi_teardown();
-                        enter_provisioning();
-                    }
+                ESP_LOGW(TAG, "连接失败 %d/%d(原因 %d)",
+                         s_connect_fails, WIFI_FAIL_TO_PROVISION, s_last_disc_reason);
+                bool may_auto_reprov = s_connect_fails >= WIFI_FAIL_TO_PROVISION
+                    // 只有凭据/关联类失败(密码错、找不到 AP)才允许自动重配;
+                    // beacon 超时等临时原因只重试
+                    && jianlu_wifi_reason_is_cred_error(s_last_disc_reason)
+                    // 本启动拿到过 IP = 凭据是好的,绝不自动重配
+                    && !s_ever_got_ip
+                    // 开机 10 分钟内禁止(刚配完就被要求再配是荒谬的;
+                    // uptime 起点即配网成功后的重启点)
+                    && (esp_timer_get_time() / 1000LL) > 600LL * 1000LL;
+                if (may_auto_reprov && !enter_offline()) {
+                    // 无快照可示且凭据类失败:才转配网
+                    ESP_LOGW(TAG, "凭据类连接失败且无快照,转入配网态");
+                    // 配网/联网分离:先释放 Wi-Fi 的 ~56KB,BLUFI 才有地方住
+                    wifi_teardown();
+                    enter_provisioning();
                 } else {
+                    if (may_auto_reprov) {
+                        ESP_LOGW(TAG, "连接屡败但快照在位,保持离线等路由器恢复");
+                    }
                     schedule_wifi_retry();
                 }
             }
@@ -1427,10 +1453,14 @@ static void app_task(void *arg)
                 ui_refresh(JIANLU_ANIM_NONE);
                 break;
             case JIANLU_PROV_GOT_WIFI:
-                ESP_LOGI(TAG, "收到 Wi-Fi 凭据(ssid=%s),存 NVS 并重启进入联网",
+                ESP_LOGI(TAG, "收到 Wi-Fi 凭据(ssid=%s),原子落盘并重启联网",
                          s_prov_ssid);
-                jianlu_nvs_save_wifi(s_prov_ssid, s_prov_pass);
-                jianlu_nvs_save_reprov(0);   // 配网完成,清除强制标志
+                // 单事务写凭据+清强制标志:防止"凭据在、标志也在"的半提交态
+                esp_err_t pv = jianlu_nvs_save_provisioned(s_prov_ssid, s_prov_pass);
+                if (pv != ESP_OK) {
+                    ESP_LOGE(TAG, "配网落盘失败: %s(留在配网态重试)", esp_err_to_name(pv));
+                    break;
+                }
                 vTaskDelay(pdMS_TO_TICKS(300));   // 让日志与 BLE 事件发完
                 esp_restart();
                 break;
@@ -1543,7 +1573,10 @@ static void app_task(void *arg)
             refresh_home();
             break;
         case EV_OFFLINE_RETRY:
-            if (s_store.offline && s_wifi_connected && jianlu_hub_base()[0] != '\0') {
+            // 离线模式与错误页(无快照的联网失败)都持续重试,
+            // 恢复后自动回在线——错误页绝不成为死端
+            if ((s_store.offline || s_store.view == JIANLU_VIEW_ERROR)
+                && s_wifi_connected && jianlu_hub_base()[0] != '\0') {
                 request_fetch();
             }
             break;

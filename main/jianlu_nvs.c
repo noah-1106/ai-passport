@@ -83,6 +83,23 @@ esp_err_t jianlu_nvs_save_reprov(uint8_t on)
     return nvs_save_u8("reprov", on);
 }
 
+esp_err_t jianlu_nvs_save_provisioned(const char *ssid, const char *pass)
+{
+    if (ssid == NULL || pass == NULL) return ESP_ERR_INVALID_ARG;
+    if (strlen(ssid) >= JIANLU_NVS_SSID_LEN || strlen(pass) >= JIANLU_NVS_PASS_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = open(&h, NVS_READWRITE);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, "wifi_ssid", ssid);
+    if (err == ESP_OK) err = nvs_set_str(h, "wifi_pass", pass);
+    if (err == ESP_OK) err = nvs_set_u8(h, "reprov", 0);   // 同事务清标志
+    if (err == ESP_OK) err = nvs_commit(h);                // 单次提交,原子生效
+    nvs_close(h);
+    return err;
+}
+
 esp_err_t jianlu_nvs_save_image_ver(bool avatar, uint64_t ver)
 {
     nvs_handle_t h;

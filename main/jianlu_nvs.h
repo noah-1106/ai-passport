@@ -45,3 +45,7 @@ esp_err_t jianlu_nvs_clear_provisioning(void);
 // 强制配网标志(重配确认时置 1;BLUFI 收到新凭据时清 0)。
 // 语义:重配 = 强制走配网,即使 Kconfig/NVS 还有旧凭据。
 esp_err_t jianlu_nvs_save_reprov(uint8_t on);
+
+// 配网成功落盘:凭据写入 + 强制标志清除,同一事务(单次 commit)。
+// 修复"两笔独立提交间掉电/失败 → 有凭据但标志在位 → 永远强制配网"。
+esp_err_t jianlu_nvs_save_provisioned(const char *ssid, const char *pass);

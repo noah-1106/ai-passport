@@ -37,3 +37,18 @@ jianlu_fail_view_t jianlu_fetch_fail_view(bool snapshot_ok)
 {
     return snapshot_ok ? JIANLU_FAIL_OFFLINE : JIANLU_FAIL_ERROR;
 }
+
+bool jianlu_wifi_reason_is_cred_error(int reason)
+{
+    switch (reason) {
+    case 15:   // 4-way handshake timeout(密码错)
+    case 201:  // NO_AP_FOUND
+    case 202:  // AUTH_FAIL
+    case 203:  // ASSOC_FAIL
+    case 204:  // HANDSHAKE_TIMEOUT
+    case 205:  // CONNECTION_FAIL(密码错时与 15 交替出现)
+        return true;
+    default:
+        return false;   // 200=beacon timeout 等临时原因:只重试,不配网
+    }
+}

@@ -48,3 +48,7 @@ typedef enum {
 } jianlu_fail_view_t;
 
 jianlu_fail_view_t jianlu_fetch_fail_view(bool snapshot_ok);
+
+// Wi-Fi 断开原因是否为"凭据/关联类失败"(连不上 AP)。
+// 只有这类失败才允许自动转配网;beacon 超时/路由器重启等临时原因绝不触发。
+bool jianlu_wifi_reason_is_cred_error(int reason);
