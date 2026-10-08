@@ -134,8 +134,17 @@ run_static_checks() {
             "${IDF_PATH}/components/json/cJSON/cJSON.c" \
             -o "${test_dir}/test_jianlu_json"
         "${test_dir}/test_jianlu_json"
+        # BLE 直连协议编解码(同样依赖 cJSON)
+        "${CC:-cc}" -std=c11 -Wall -Wextra \
+            -Imain -I"${IDF_PATH}/components/json/cJSON" \
+            tests/test_jianlu_dlink_codec.c main/jianlu_dlink_codec.c \
+            main/jianlu_store.c \
+            "${IDF_PATH}/components/json/cJSON/cJSON.c" \
+            -o "${test_dir}/test_jianlu_dlink_codec"
+        "${test_dir}/test_jianlu_dlink_codec"
     else
         echo "test_jianlu_json: SKIP (IDF cJSON source not found)"
+        echo "test_jianlu_dlink_codec: SKIP (IDF cJSON source not found)"
     fi
     # Linux ld 用 --gc-sections;macOS ld 对应 -dead_strip。
     local gc_flag="--gc-sections"

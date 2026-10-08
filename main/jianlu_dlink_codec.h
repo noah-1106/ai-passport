@@ -11,6 +11,10 @@
 //   {"c":"vget","slot":1}                                拉取该槽语音(分块)
 //   {"c":"vdel","slot":1}                                删除该槽语音
 //   {"c":"reset"}                                        清空清单区(重推前)
+//   {"c":"time","epoch":<unix秒>}                        对时(卡片 settimeofday)
+//   {"c":"profile","nickname":..,"signature":..}         资料(昵称/签名)
+//   {"c":"imgb","kind":"avatar"|"qrcode","total":N}      图片开始(N 块)
+//   {"c":"imgc","kind":..,"seq":i,"data":"<b64>"}        图片分块(解码后≤1400B/块)
 // 卡片→桥:
 //   {"r":"ok"[,...]}                                     各命令确认
 //   {"r":"plist","ids":["7","9"]}
@@ -24,9 +28,13 @@
 
 #include "jianlu_store.h"
 
+#include "jianlu_json.h"     // 昵称/签名缓冲长度与 hub 侧一致
+
 #define JIANLU_DL_CHUNK_RECORDS 2    // 每块最多记录数(由桥分块,卡片只收)
 #define JIANLU_DL_VOICE_CHUNK   180  // 语音分块原始字节数(b64 后 240 字符)
 #define JIANLU_DL_LINE_MAX      2048  // 单行上限(桥按 2 条/块限长)
+#define JIANLU_DL_IMG_RAW_MAX   1400  // imgc 单块解码后原始字节上限(行上限约束)
+#define JIANLU_DL_KIND_LEN      8     // "avatar"/"qrcode"
 
 typedef enum {
     JIANLU_DL_CMD_NONE = 0,
@@ -37,6 +45,10 @@ typedef enum {
     JIANLU_DL_CMD_VGET,      // 拉语音
     JIANLU_DL_CMD_VDEL,      // 删语音
     JIANLU_DL_CMD_RESET,     // 清清单
+    JIANLU_DL_CMD_TIME,      // 对时
+    JIANLU_DL_CMD_PROFILE,   // 资料(昵称/签名)
+    JIANLU_DL_CMD_IMGB,      // 图片开始
+    JIANLU_DL_CMD_IMGC,      // 图片分块
     JIANLU_DL_CMD_BAD,       // 解析失败/未知
 } jianlu_dl_cmd_t;
 
@@ -49,6 +61,16 @@ typedef struct {
     // records 块的载荷(指向行内 JSON 数组,仅解析期间有效)
     const char *records_json;
     size_t records_json_len;
+    // time:unix 秒
+    int64_t epoch;
+    // profile:昵称/签名(字段缺失按空串;UTF-8 安全截断)
+    char nickname[JIANLU_NICKNAME_LEN];
+    char signature[JIANLU_SIGNATURE_LEN];
+    // imgb/imgc:图片类别("avatar"/"qrcode")
+    char kind[JIANLU_DL_KIND_LEN];
+    // imgc 的 b64 载荷(指向行内原文,仅解析期间有效,调用方立即解码)
+    const char *data_b64;
+    size_t data_b64_len;
 } jianlu_dl_msg_t;
 
 // 解析一行(不含 '\n')。结构非法返回 JIANLU_DL_CMD_BAD。

@@ -92,6 +92,8 @@ typedef enum {
     EV_AUTO_TICK,        // 自动切换决策节拍(15s)
     EV_DLINK_REFRESH,    // BLE 桥推完清单:刷新简录页/主页
     EV_DLINK_PDONE,      // BLE 桥确认勾选已同步(id 在 payload)
+    EV_DLINK_PROFILE,    // BLE 桥推资料:昵称/签名(拷贝在静态缓冲)
+    EV_DLINK_IMG,        // BLE 桥推完整张图片(arg1=1 头像/0 二维码,arg2=ok)
     EV_PROFILE_DONE,     // 网络任务:资料拉取(arg1=esp_err)
     EV_AVATAR_DONE,      // 网络任务:头像下载(arg1=esp_err)
     EV_QR_DONE,          // 网络任务:二维码下载(arg1=esp_err)
@@ -168,8 +170,8 @@ static uint32_t s_hub_unreachable_s;    // Wi-Fi 态:中枢连续不可达秒数
 static uint32_t s_ble_idle_s;           // BLE 态:桥未连接秒数
 static esp_timer_handle_t s_auto_timer;
 
-#define AVATAR_PATH "/voicefs/avatar.raw"
-#define QRCODE_PATH "/voicefs/qrcode.raw"
+#define AVATAR_PATH JIANLU_AVATAR_PATH       // 缓存路径统一在 jianlu_capture.h
+#define QRCODE_PATH JIANLU_QRCODE_PATH
 static bool s_prov_running;
 static bool s_diag_done;           // 诊断矩阵本启动周期已跑过
 static bool s_reprov_confirm;        // 重配确认页显示中
@@ -1407,6 +1409,32 @@ static void dlink_pdone_cb(const char *id)
     post_event(EV_DLINK_PDONE, 0, 0, id);
 }
 
+// BLE 资料接线:回调在 NimBLE 主机任务,字符串只拷进静态缓冲再投事件
+static char s_dlink_nick[JIANLU_NICKNAME_LEN];
+static char s_dlink_sign[JIANLU_SIGNATURE_LEN];
+
+static void dlink_time_cb(int64_t epoch)
+{
+    // 纯系统调用,可在主机任务直接做;对时后录音时间戳/主页时钟不再停摆
+    struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "直连对时 epoch=%lld", (long long)epoch);
+}
+
+static void dlink_profile_cb(const char *nickname, const char *signature)
+{
+    jianlu_utf8_copy(s_dlink_nick, sizeof(s_dlink_nick), nickname,
+                     sizeof(s_dlink_nick) - 1);
+    jianlu_utf8_copy(s_dlink_sign, sizeof(s_dlink_sign), signature,
+                     sizeof(s_dlink_sign) - 1);
+    post_event(EV_DLINK_PROFILE, 0, 0, NULL);
+}
+
+static void dlink_img_cb(bool avatar, bool ok)
+{
+    post_event(EV_DLINK_IMG, avatar ? 1 : 0, ok ? 1 : 0, NULL);
+}
+
 static void on_auto_tick(void)
 {
     static int tick_n;
@@ -1780,6 +1808,40 @@ static void app_task(void *arg)
             jianlu_store_remove(&s_store, ev.id);
             ui_refresh(JIANLU_ANIM_COMPLETE);
             break;
+        case EV_DLINK_PROFILE:
+            // 桥推的资料(纯蓝牙路径与 Wi-Fi 的 EV_PROFILE_DONE 同效)
+            jianlu_utf8_copy(s_profile.nickname, sizeof(s_profile.nickname),
+                             s_dlink_nick, sizeof(s_profile.nickname) - 1);
+            jianlu_utf8_copy(s_profile.signature, sizeof(s_profile.signature),
+                             s_dlink_sign, sizeof(s_profile.signature) - 1);
+            ESP_LOGI(TAG, "直连资料: 昵称=%s", s_profile.nickname);
+            if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
+            break;
+        case EV_DLINK_IMG: {
+            // 桥推完整张图片(缓存文件已由 dlink 落盘/清理)
+            bool avatar = ev.arg1 == 1;
+            bool ok = ev.arg2 == 1;
+            if (ok) {
+                if (avatar) {
+                    s_profile.has_avatar = true;
+                    jianlu_ui_avatar_dirty();
+                } else {
+                    s_profile.has_qrcode = true;
+                }
+                ESP_LOGI(TAG, "直连图片就绪: %s", avatar ? "头像" : "二维码");
+            } else {
+                ESP_LOGW(TAG, "直连图片中断: %s", avatar ? "头像" : "二维码");
+            }
+            if (s_nav.page == JIANLU_PAGE_HOME) refresh_home();
+            if (s_nav.page == JIANLU_PAGE_QR) {
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_qr_set(jianlu_hub_cache_exists(QRCODE_PATH),
+                                     &s_profile);
+                    bsp_lvgl_unlock();
+                }
+            }
+            break;
+        }
         case EV_PROFILE_DONE:
             if ((esp_err_t)ev.arg1 == ESP_OK) {
                 memcpy(&s_profile, &s_profile_tmp, sizeof(s_profile));
@@ -1886,6 +1948,7 @@ void jianlu_app_start(void)
         jianlu_store_set_view(&s_store, JIANLU_VIEW_READY, NULL);
         jianlu_dlink_bind(&s_store, dlink_ui_refresh_cb);
         jianlu_dlink_set_pdone_cb(dlink_pdone_cb);
+        jianlu_dlink_set_app_cbs(dlink_time_cb, dlink_profile_cb, dlink_img_cb);
         jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
         jianlu_dlink_start();
         ESP_LOGI(TAG, "堆: 直连就绪后 %u", (unsigned)esp_get_free_heap_size());

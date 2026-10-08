@@ -57,6 +57,39 @@ static struct {
 } s_pdone;   // 待同步勾选(桥 plist 上报成功即清)
 static void (*s_on_pdone)(const char *id);
 
+// 资料/对时回调(NimBLE 主机任务上下文)
+static void (*s_on_time)(int64_t epoch);
+static void (*s_on_profile)(const char *nickname, const char *signature);
+static void (*s_on_img_done)(bool avatar, bool ok);
+
+void jianlu_dlink_set_app_cbs(void (*on_time)(int64_t),
+                              void (*on_profile)(const char *, const char *),
+                              void (*on_img_done)(bool, bool))
+{
+    s_on_time = on_time;
+    s_on_profile = on_profile;
+    s_on_img_done = on_img_done;
+}
+
+// ---- 图片接收状态(imgb 开始 → imgc 逐块 → 收齐落盘)----
+// 直写最终缓存路径,中断/失败即 remove(与 hub 下载路径同策略,不留半成品)。
+static struct {
+    FILE *f;
+    bool avatar;   // true=avatar.raw false=qrcode.raw
+    int total;
+    int got;
+} s_img;
+static uint8_t s_img_raw[JIANLU_DL_IMG_RAW_MAX];
+
+static void img_abort(void)
+{
+    if (s_img.f == NULL) return;
+    fclose(s_img.f);
+    s_img.f = NULL;
+    remove(s_img.avatar ? JIANLU_AVATAR_PATH : JIANLU_QRCODE_PATH);
+    s_img.total = s_img.got = 0;
+}
+
 void jianlu_dlink_bind(jianlu_store_t *store, jianlu_dlink_ui_cb refresh)
 {
     s_store = store;
@@ -66,9 +99,7 @@ void jianlu_dlink_bind(jianlu_store_t *store, jianlu_dlink_ui_cb refresh)
 void jianlu_dlink_set_pdone_cb(void (*cb)(const char *id))
 {
     s_on_pdone = cb;
-}
-
-// 供应用把离线勾选转成直连待同步列表(进入直连时调用)
+}// 供应用把离线勾选转成直连待同步列表(进入直连时调用)
 void jianlu_dlink_set_pending(const char (*ids)[JIANLU_ID_LEN], int n)
 {
     s_pdone.count = n > JIANLU_VOICEQ_SLOTS ? JIANLU_VOICEQ_SLOTS : n;
@@ -310,6 +341,69 @@ static void handle_line(const char *line, size_t len)
         stream_request(slot);
         break;
     }
+    case JIANLU_DL_CMD_TIME:
+        // 对时:纯系统调用,可直接在主机任务做
+        if (s_on_time) s_on_time(msg.epoch);
+        reply("{\"r\":\"ok\"}");
+        break;
+    case JIANLU_DL_CMD_PROFILE:
+        // 昵称/签名:回调里只许拷贝+投事件(字符串仅本行解析期间有效)
+        if (s_on_profile) s_on_profile(msg.nickname, msg.signature);
+        reply("{\"r\":\"ok\"}");
+        break;
+    case JIANLU_DL_CMD_IMGB: {
+        img_abort();   // 上一张没收齐?丢弃重来
+        bool avatar = strcmp(msg.kind, "avatar") == 0;
+        if (!avatar && strcmp(msg.kind, "qrcode") != 0) {
+            reply("{\"r\":\"bad\"}");
+            break;
+        }
+        const char *path = avatar ? JIANLU_AVATAR_PATH : JIANLU_QRCODE_PATH;
+        remove(path);   // 覆盖旧缓存,失败不留半成品
+        s_img.f = fopen(path, "wb");
+        if (s_img.f == NULL) {
+            reply("{\"r\":\"bad\"}");
+            break;
+        }
+        s_img.avatar = avatar;
+        s_img.total = msg.total;
+        s_img.got = 0;
+        reply("{\"r\":\"ok\"}");
+        break;
+    }
+    case JIANLU_DL_CMD_IMGC: {
+        if (s_img.f == NULL
+            || (strcmp(msg.kind, "avatar") == 0) != s_img.avatar
+            || msg.seq != s_img.got) {
+            img_abort();
+            reply("{\"r\":\"bad\"}");
+            break;
+        }
+        size_t n = jianlu_dlink_b64_decode(s_img_raw, sizeof(s_img_raw),
+                                           msg.data_b64, msg.data_b64_len,
+                                           NULL);
+        if (n == (size_t)-1 || n == 0
+            || fwrite(s_img_raw, 1, n, s_img.f) != n) {
+            img_abort();
+            reply("{\"r\":\"bad\"}");
+            break;
+        }
+        s_img.got++;
+        if (s_img.got < s_img.total) {
+            reply("{\"r\":\"ok\"}");
+            break;
+        }
+        // 收齐:收尾落盘,通知应用刷头像/二维码
+        bool avatar = s_img.avatar;
+        int total = s_img.total;
+        fclose(s_img.f);
+        s_img.f = NULL;
+        s_img.total = s_img.got = 0;
+        ESP_LOGI(TAG, "图片收齐 %s %d 块", avatar ? "avatar" : "qrcode", total);
+        if (s_on_img_done) s_on_img_done(avatar, true);
+        reply("{\"r\":\"ok\"}");
+        break;
+    }
     default:
         reply("{\"r\":\"bad\"}");
         break;
@@ -418,6 +512,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "桥断开 reason=%d", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_tx_subscribed = false;
+        img_abort();   // 图片没收齐:丢弃半成品,桥下次连接重推
         start_advertising();
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:

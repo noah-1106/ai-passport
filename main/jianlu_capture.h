@@ -16,6 +16,11 @@
 // 录音块大小(字节):每块约 64ms 音频,也是松开轮询的粒度。
 #define JIANLU_REC_CHUNK_BYTES 2048
 
+// voicefs 里的资料图片缓存(Wi-Fi 下载与 BLE 直连 imgb/imgc 共用同一文件,
+// 失败/中断即 remove,不留半成品——与 hub 下载路径同策略)。
+#define JIANLU_AVATAR_PATH "/voicefs/avatar.raw"
+#define JIANLU_QRCODE_PATH "/voicefs/qrcode.raw"
+
 // 挂载 voicefs 分区(SPIFFS,format_if_mount_failed),并迁移旧版 pending.wav。幂等。
 esp_err_t jianlu_capture_init(void);
 

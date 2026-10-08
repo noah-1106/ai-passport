@@ -76,6 +76,42 @@ static bool get_int(const cJSON *root, const char *key, int *out)
     return true;
 }
 
+// imgb/imgc 的 kind:非空短串(具体取值由调用方映射到缓存路径)
+static bool dlink_get_kind(const cJSON *root, char *dst, size_t cap)
+{
+    const cJSON *k = cJSON_GetObjectItemCaseSensitive(root, "kind");
+    if (!cJSON_IsString(k) || k->valuestring == NULL
+        || k->valuestring[0] == '\0' || strlen(k->valuestring) >= cap) {
+        return false;
+    }
+    snprintf(dst, cap, "%s", k->valuestring);
+    return true;
+}
+
+// 在原始行里找 "key":"value" 的 value 段(不依赖 cJSON 树的生命周期)。
+// 协议载荷是 base64(不含 '"' 与转义),扫到下一个 '"' 即值尾。
+static bool find_raw_string(const char *line, size_t len, const char *key,
+                            const char **out, size_t *out_len)
+{
+    char pat[16];
+    int pn = snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    if (pn <= 0 || (size_t)pn >= sizeof(pat)) return false;
+    for (size_t i = 0; i + (size_t)pn < len; i++) {
+        if (memcmp(line + i, pat, (size_t)pn) != 0) continue;
+        size_t start = i + (size_t)pn;
+        for (size_t j = start; j < len; j++) {
+            if (line[j] == '"') {
+                if (j == start) return false;   // 空值
+                *out = line + start;
+                *out_len = j - start;
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 bool jianlu_dlink_parse(const char *line, size_t len, jianlu_dl_msg_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -122,7 +158,49 @@ bool jianlu_dlink_parse(const char *line, size_t len, jianlu_dl_msg_t *out)
             out->cmd = (s[1] == 'g') ? JIANLU_DL_CMD_VGET : JIANLU_DL_CMD_VDEL;
             ok = get_int(root, "slot", &out->slot);
         } else if (strcmp(s, "reset") == 0) out->cmd = JIANLU_DL_CMD_RESET;
-        else ok = false;
+        else if (strcmp(s, "time") == 0) {
+            out->cmd = JIANLU_DL_CMD_TIME;
+            const cJSON *e = cJSON_GetObjectItemCaseSensitive(root, "epoch");
+            if (cJSON_IsNumber(e)) {
+                out->epoch = (int64_t)e->valuedouble;
+            } else {
+                ok = false;
+            }
+        } else if (strcmp(s, "profile") == 0) {
+            out->cmd = JIANLU_DL_CMD_PROFILE;
+            const cJSON *n = cJSON_GetObjectItemCaseSensitive(root, "nickname");
+            const cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "signature");
+            if (!cJSON_IsString(n) && n != NULL) ok = false;
+            if (!cJSON_IsString(g) && g != NULL) ok = false;
+            if (ok) {
+                jianlu_utf8_copy(out->nickname, sizeof(out->nickname),
+                                 cJSON_IsString(n) ? n->valuestring : "",
+                                 sizeof(out->nickname) - 1);
+                jianlu_utf8_copy(out->signature, sizeof(out->signature),
+                                 cJSON_IsString(g) ? g->valuestring : "",
+                                 sizeof(out->signature) - 1);
+            }
+        } else if (strcmp(s, "imgb") == 0) {
+            out->cmd = JIANLU_DL_CMD_IMGB;
+            ok = dlink_get_kind(root, out->kind, sizeof(out->kind))
+                 && get_int(root, "total", &out->total) && out->total >= 1;
+        } else if (strcmp(s, "imgc") == 0) {
+            out->cmd = JIANLU_DL_CMD_IMGC;
+            ok = dlink_get_kind(root, out->kind, sizeof(out->kind))
+                 && get_int(root, "seq", &out->seq);
+            if (ok) {
+                // b64 载荷直接指行内原文(cJSON 树销毁后仍有效);
+                // b64 字母表不含 '"' 与 '\',扫到下一个引号即值尾
+                const char *p = NULL;
+                size_t plen = 0;
+                if (find_raw_string(line, len, "data", &p, &plen)) {
+                    out->data_b64 = p;
+                    out->data_b64_len = plen;
+                } else {
+                    ok = false;
+                }
+            }
+        } else ok = false;
     } else {
         ok = false;
     }

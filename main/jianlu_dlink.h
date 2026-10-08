@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "jianlu_store.h"
 
@@ -25,3 +26,13 @@ void jianlu_dlink_bind(jianlu_store_t *store, void (*refresh)(void));
 void jianlu_dlink_set_pending(const char (*ids)[JIANLU_ID_LEN], int n);
 // 桥确认某条勾选已 PUT 成功后回调(NimBLE 主机任务上下文,只许投事件)
 void jianlu_dlink_set_pdone_cb(void (*cb)(const char *id));
+
+// 资料/对时接线(均 NimBLE 主机任务上下文,只许投事件或纯系统调用):
+//   on_time     — 桥推 {"c":"time"}:应用 settimeofday
+//   on_profile  — 桥推 {"c":"profile"}:昵称/签名(本行解析期间有效,需即拷)
+//   on_img_done — 桥推完整张图片(avatar 区分哪张;ok=false 表示中断/失败,
+//                 此时缓存文件已清,资料标志不应置位)
+void jianlu_dlink_set_app_cbs(void (*on_time)(int64_t epoch),
+                              void (*on_profile)(const char *nickname,
+                                                 const char *signature),
+                              void (*on_img_done)(bool avatar, bool ok));
