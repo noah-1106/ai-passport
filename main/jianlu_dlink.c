@@ -115,27 +115,46 @@ static void send_line(const char *line)
 static volatile int s_stream_slot;
 static TaskHandle_t s_stream_task;
 
-// 发一行(逐 MTU-3 分片,indication,上一条未 ACK 时等)
-static void stream_send_line(const char *line)
+// 发一行(逐 MTU-3 分片,indication,上一条未 ACK 时等)。
+// 返回 false = 连接断开或长时间发不出去(调用方应中止整槽,绝不静默跳片)。
+// 注意:ble_gatts_indicate_custom 失败时自己已 free mbuf(源码 done: 标签),
+// 这里不能再 free —— 曾经的"重试前再 free"在 EBUSY 时双重释放,MSYS 池被
+// 打穿后表现为语音流中途丢首片(桥端拼出半行 JSON)+ 池耗尽卡死。
+static bool stream_send_line(const char *line)
 {
     uint16_t mtu = ble_att_mtu(s_conn_handle);
     size_t chunk = mtu > 3 ? (size_t)(mtu - 3) : 20;
     size_t len = strlen(line);
     for (size_t off = 0; off < len; off += chunk) {
         size_t take = len - off > chunk ? chunk : len - off;
-        for (int tries = 0; tries < 600; tries++) {
-            if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+        bool sent = false;
+        for (int tries = 0; tries < 600 && !sent; tries++) {
+            if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
             struct os_mbuf *om = ble_hs_mbuf_from_flat(
                 (const uint8_t *)line + off, take);
             if (om != NULL) {
                 int rc = ble_gatts_indicate_custom(s_conn_handle,
                                                    s_tx_val_handle, om);
-                if (rc == 0) break;   // 已入队,ACK 异步回来
-                if (om != NULL) os_mbuf_free_chain(om);
+                if (rc == 0) {
+                    sent = true;   // 已入队,ACK 异步回来
+                    break;
+                }
+                // rc!=0:om 所有权已归 indicate_custom(含失败),不得再碰
+            }
+            if (tries > 0 && tries % 200 == 0) {
+                ESP_LOGW(TAG, "indication 积压(off=%u,%u/%u 字节)第 %d 次重试",
+                         (unsigned)off, (unsigned)(off + take), (unsigned)len,
+                         tries);
             }
             vTaskDelay(pdMS_TO_TICKS(15));   // EBUSY:上一条未 ACK,等
         }
+        if (!sent) {
+            ESP_LOGE(TAG, "indication 重试耗尽(off=%u/%u),放弃本槽",
+                     (unsigned)off, (unsigned)len);
+            return false;
+        }
     }
+    return true;
 }
 
 static void stream_task(void *arg)
@@ -170,8 +189,11 @@ static void stream_task(void *arg)
             if (n == 0) break;
             out[n] = '\n';
             out[n + 1] = '\0';
-            if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) break;
-            stream_send_line(out);
+            if (!stream_send_line(out)) {
+                ESP_LOGW(TAG, "语音流中止 slot=%d seq=%d/%d(断连或积压超时)",
+                         slot, seq, total);
+                break;
+            }
         }
         fclose(f);
         if (seq >= total && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
