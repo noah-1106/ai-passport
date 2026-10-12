@@ -2,6 +2,7 @@
 #include "jianlu_dlink.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_err.h"
@@ -10,6 +11,7 @@
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_att.h"
@@ -73,16 +75,22 @@ void jianlu_dlink_set_app_cbs(void (*on_time)(int64_t),
 
 // ---- 图片接收状态(imgb 开始 → imgc 逐块 → 收齐落盘)----
 // 直写最终缓存路径,中断/失败即 remove(与 hub 下载路径同策略,不留半成品)。
+// 解码缓冲按需 malloc:静态 bss 会挤占配网期 Wi-Fi+NimBLE 共存的堆预算
+// (曾致 esp_nimble_enable 内 xTaskCreate 静默失败,BLUFI 永不广播)。
 static struct {
     FILE *f;
+    uint8_t *raw;  // JIANLU_DL_IMG_RAW_MAX 字节,imgb 时分配,收尾/中止即释放
     bool avatar;   // true=avatar.raw false=qrcode.raw
     int total;
     int got;
 } s_img;
-static uint8_t s_img_raw[JIANLU_DL_IMG_RAW_MAX];
 
 static void img_abort(void)
 {
+    if (s_img.raw) {
+        free(s_img.raw);
+        s_img.raw = NULL;
+    }
     if (s_img.f == NULL) return;
     fclose(s_img.f);
     s_img.f = NULL;
@@ -360,8 +368,10 @@ static void handle_line(const char *line, size_t len)
         }
         const char *path = avatar ? JIANLU_AVATAR_PATH : JIANLU_QRCODE_PATH;
         remove(path);   // 覆盖旧缓存,失败不留半成品
+        s_img.raw = malloc(JIANLU_DL_IMG_RAW_MAX);
         s_img.f = fopen(path, "wb");
-        if (s_img.f == NULL) {
+        if (s_img.raw == NULL || s_img.f == NULL) {
+            img_abort();
             reply("{\"r\":\"bad\"}");
             break;
         }
@@ -372,18 +382,18 @@ static void handle_line(const char *line, size_t len)
         break;
     }
     case JIANLU_DL_CMD_IMGC: {
-        if (s_img.f == NULL
+        if (s_img.f == NULL || s_img.raw == NULL
             || (strcmp(msg.kind, "avatar") == 0) != s_img.avatar
             || msg.seq != s_img.got) {
             img_abort();
             reply("{\"r\":\"bad\"}");
             break;
         }
-        size_t n = jianlu_dlink_b64_decode(s_img_raw, sizeof(s_img_raw),
+        size_t n = jianlu_dlink_b64_decode(s_img.raw, JIANLU_DL_IMG_RAW_MAX,
                                            msg.data_b64, msg.data_b64_len,
                                            NULL);
         if (n == (size_t)-1 || n == 0
-            || fwrite(s_img_raw, 1, n, s_img.f) != n) {
+            || fwrite(s_img.raw, 1, n, s_img.f) != n) {
             img_abort();
             reply("{\"r\":\"bad\"}");
             break;
@@ -398,6 +408,8 @@ static void handle_line(const char *line, size_t len)
         int total = s_img.total;
         fclose(s_img.f);
         s_img.f = NULL;
+        free(s_img.raw);
+        s_img.raw = NULL;
         s_img.total = s_img.got = 0;
         ESP_LOGI(TAG, "图片收齐 %s %d 块", avatar ? "avatar" : "qrcode", total);
         if (s_on_img_done) s_on_img_done(avatar, true);
@@ -570,10 +582,14 @@ static void on_sync(void)
     start_advertising();
 }
 
+static SemaphoreHandle_t s_host_stopped;   // 停栈等待(连接方式测试的回滚路径)
+static bool s_host_running;                // 主机任务在跑(stop 的幂等守卫)
+
 static void host_task(void *arg)
 {
     (void)arg;
     nimble_port_run();   // 返回即主机停止
+    if (s_host_stopped) xSemaphoreGive(s_host_stopped);
     nimble_port_freertos_deinit();
 }
 
@@ -583,6 +599,7 @@ bool jianlu_dlink_start(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_dev_name, sizeof(s_dev_name), "XIAONUO_%02X%02X", mac[4], mac[5]);
 
+    if (!s_host_stopped) s_host_stopped = xSemaphoreCreateBinary();
     // NimBLE 引导(与 jianlu_provision 同栈,但不经 BLUFI profile)
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -598,7 +615,29 @@ bool jianlu_dlink_start(void)
         ESP_LOGE(TAG, "esp_nimble_enable 失败: %s", esp_err_to_name(err));
         return false;
     }
+    s_host_running = true;
     return true;
+}
+
+// 停栈(连接方式「先测后切」的回滚路径):断连接 → 停主机任务 → 释放 NimBLE
+// 主机内存。BT 控制器与 provision_stop 同策略保留(重启动/start 直接复用);
+// bind/cbs 的函数指针是静态登记,重启 start 无需重新接线。
+// 幂等:start 失败/重复 stop 直接返回(主机未起时调 nimble_port_stop 会崩)。
+void jianlu_dlink_stop(void)
+{
+    if (!s_host_running) return;
+    s_host_running = false;
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    s_tx_subscribed = false;
+    if (nimble_port_stop() == 0 && s_host_stopped) {
+        // 等主机任务退出后再 deinit(与 provision_stop 同款顺序)
+        xSemaphoreTake(s_host_stopped, pdMS_TO_TICKS(2000));
+    }
+    nimble_port_deinit();
+    ESP_LOGI(TAG, "直连栈已停止");
 }
 
 bool jianlu_dlink_connected(void)

@@ -15,18 +15,31 @@ typedef enum {
     JIANLU_WIFI_KCONFIG,
 } jianlu_wifi_src_t;
 
-// 启动模式决策(优先级:直连 > 强制配网 > 凭据联网 > 出厂配网)。
-// 直连(BLE-only)不需要 Wi-Fi 凭据:dmode 在位时无论凭据/重配状态
-// 一律进 BLE,配网页只属于"Wi-Fi 模式且无凭据"。
+// 连接方式(设置页三档,持久化在 NVS "cmode"):
+//   自动     默认 Wi-Fi;中枢持续不可达自动转蓝牙直连,直连空闲自动回 Wi-Fi
+//   Wi-Fi    只用 Wi-Fi 中枢,永不自动切蓝牙
+//   蓝牙直连 只用 BLE 直连(电脑桥),常驻不自动退出
 typedef enum {
-    JIANLU_BOOT_BLE = 0,     // dmode 直连标志在位:BLE 广播,跳过一切 Wi-Fi 逻辑
+    JIANLU_CMODE_AUTO = 0,
+    JIANLU_CMODE_WIFI,
+    JIANLU_CMODE_BLE,
+} jianlu_cmode_t;
+
+// 启动模式决策(优先级:蓝牙直连档 > 强制配网 > 凭据联网 > 出厂配网)。
+// 直连(BLE-only)不需要 Wi-Fi 凭据:cmode=BLE(或自动档且 dmode 在位)时
+// 无论凭据/重配状态一律进 BLE,配网页只属于"Wi-Fi 侧且无凭据"。
+typedef enum {
+    JIANLU_BOOT_BLE = 0,     // BLE 直连:BLE 广播,跳过一切 Wi-Fi 逻辑
     JIANLU_BOOT_PROV_FORCE,  // reprov 标志在位:用户要求重配,强制配网态
     JIANLU_BOOT_WIFI,        // 有凭据(NVS/Kconfig):正常联网路径
     JIANLU_BOOT_PROV_FRESH,  // 无凭据:出厂配网模式
 } jianlu_boot_mode_t;
 
-jianlu_boot_mode_t jianlu_config_boot_mode(bool dmode, bool reprov,
-                                           jianlu_wifi_src_t wifi_src);
+jianlu_boot_mode_t jianlu_config_boot_mode(jianlu_cmode_t cmode, bool dmode,
+                                           bool reprov, jianlu_wifi_src_t wifi_src);
+
+// 连接方式显示名(设置页/日志用);越界返回 "自动"
+const char *jianlu_cmode_name(int cmode);
 
 typedef enum {
     JIANLU_HUB_NONE = 0,

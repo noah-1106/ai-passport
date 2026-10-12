@@ -52,6 +52,21 @@ esp_err_t jianlu_nvs_load(jianlu_nvs_data_t *data)
     uint8_t dlock = 0;
     nvs_get_u8(h, "dlock", &dlock);
     data->dlock = dlock;
+    uint8_t cmode = 0;
+    if (nvs_get_u8(h, "cmode", &cmode) == ESP_ERR_NVS_NOT_FOUND) {
+        // 迁移:旧设备没有 cmode——旧"手动直连(dmode+dlock)"映射为蓝牙直连档,
+        // 其余一律自动档(旧默认行为)
+        cmode = (dmode && dlock) ? 2 : 0;
+    }
+    if (cmode > 2) cmode = 0;   // 越界回默认
+    data->cmode = cmode;
+    uint8_t pend = 0xFF;
+    nvs_get_u8(h, "cmode_pend", &pend);
+    if (pend != 0xFF && pend > 2) pend = 0xFF;   // 越界视同无
+    data->cmode_pend = pend;
+    uint8_t cmfail = 0;
+    nvs_get_u8(h, "cmode_fail", &cmfail);
+    data->cmode_fail = cmfail;
     nvs_close(h);
     return ESP_OK;
 }
@@ -94,9 +109,19 @@ esp_err_t jianlu_nvs_save_dmode(uint8_t on)
     return nvs_save_u8("dmode", on);
 }
 
-esp_err_t jianlu_nvs_save_dlock(uint8_t on)
+esp_err_t jianlu_nvs_save_cmode(uint8_t cmode)
 {
-    return nvs_save_u8("dlock", on);
+    return nvs_save_u8("cmode", cmode);
+}
+
+esp_err_t jianlu_nvs_save_cmode_pend(uint8_t pend)
+{
+    return nvs_save_u8("cmode_pend", pend);
+}
+
+esp_err_t jianlu_nvs_save_cmode_fail(uint8_t reason)
+{
+    return nvs_save_u8("cmode_fail", reason);
 }
 
 esp_err_t jianlu_nvs_save_provisioned(const char *ssid, const char *pass)

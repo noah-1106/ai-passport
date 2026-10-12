@@ -1,6 +1,7 @@
 // tests/test_jianlu_config.c —— 凭据/中枢来源优先级的 host 侧测试。
 #include <assert.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "jianlu_config.h"
 
@@ -40,29 +41,46 @@ int main(void) {
     assert(jianlu_fetch_fail_view(true) == JIANLU_FAIL_OFFLINE);
     assert(jianlu_fetch_fail_view(false) == JIANLU_FAIL_ERROR);
 
-    // 启动模式决策矩阵:直连标志 × 凭据状态 × 重配标志
-    // 直连开:无论凭据如何、甚至带着重配标志,都进 BLE(配网页绝不出现)
-    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_NVS)
+    // 启动模式决策矩阵:连接方式(cmode)× 直连态(dmode)× 凭据 × 重配
+    // 蓝牙直连档:无论凭据/重配/dmode,都进 BLE(配网页绝不出现)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_BLE, false, false, JIANLU_WIFI_NVS)
            == JIANLU_BOOT_BLE);
-    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_KCONFIG)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_BLE, false, false, JIANLU_WIFI_NONE)
            == JIANLU_BOOT_BLE);
-    assert(jianlu_config_boot_mode(true, false, JIANLU_WIFI_NONE)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_BLE, false, true, JIANLU_WIFI_NVS)
            == JIANLU_BOOT_BLE);
-    assert(jianlu_config_boot_mode(true, true, JIANLU_WIFI_NONE)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_BLE, true, true, JIANLU_WIFI_NONE)
            == JIANLU_BOOT_BLE);
-    assert(jianlu_config_boot_mode(true, true, JIANLU_WIFI_NVS)
+    // 自动档:dmode 在位(上次自动切到直连)→ BLE;否则走 Wi-Fi 路径
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, true, false, JIANLU_WIFI_NVS)
            == JIANLU_BOOT_BLE);
-    // 直连关:重配标志 > 凭据联网 > 出厂配网
-    assert(jianlu_config_boot_mode(false, true, JIANLU_WIFI_NVS)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, true, false, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_BLE);
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, false, true, JIANLU_WIFI_NVS)
            == JIANLU_BOOT_PROV_FORCE);
-    assert(jianlu_config_boot_mode(false, true, JIANLU_WIFI_NONE)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, false, true, JIANLU_WIFI_NONE)
            == JIANLU_BOOT_PROV_FORCE);
-    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_NVS)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, false, false, JIANLU_WIFI_NVS)
            == JIANLU_BOOT_WIFI);
-    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_KCONFIG)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, false, false, JIANLU_WIFI_KCONFIG)
            == JIANLU_BOOT_WIFI);
-    assert(jianlu_config_boot_mode(false, false, JIANLU_WIFI_NONE)
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_AUTO, false, false, JIANLU_WIFI_NONE)
            == JIANLU_BOOT_PROV_FRESH);
+    // Wi-Fi 中枢档:dmode 残留也忽略,永不进 BLE
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_WIFI, true, false, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_WIFI);
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_WIFI, false, false, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_WIFI);
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_WIFI, false, true, JIANLU_WIFI_NVS)
+           == JIANLU_BOOT_PROV_FORCE);
+    assert(jianlu_config_boot_mode(JIANLU_CMODE_WIFI, false, false, JIANLU_WIFI_NONE)
+           == JIANLU_BOOT_PROV_FRESH);
+
+    // 连接方式显示名
+    assert(strcmp(jianlu_cmode_name(JIANLU_CMODE_AUTO), "自动") == 0);
+    assert(strcmp(jianlu_cmode_name(JIANLU_CMODE_WIFI), "Wi-Fi 中枢") == 0);
+    assert(strcmp(jianlu_cmode_name(JIANLU_CMODE_BLE), "蓝牙直连") == 0);
+    assert(strcmp(jianlu_cmode_name(99), "自动") == 0);
 
     // Wi-Fi 断开原因分类:只有凭据/关联类失败才允许自动转配网
     assert(jianlu_wifi_reason_is_cred_error(15));    // 4-way 握手超时

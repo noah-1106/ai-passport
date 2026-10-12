@@ -10,6 +10,8 @@ jianlu_auto_action_t jianlu_auto_decide(const jianlu_auto_input_t *in)
     if (in->mode_dwell_s < JIANLU_AUTO_MIN_DWELL_S) return JIANLU_AUTO_STAY;
 
     if (!in->in_ble) {
+        // 手动 Wi-Fi 档:永不自动转 BLE
+        if (in->cmode == JIANLU_CMODE_WIFI) return JIANLU_AUTO_STAY;
         // Wi-Fi 态:中枢持续够不着 → 换更稳的 BLE 路
         if (in->hub_unreachable_s >= JIANLU_AUTO_HUB_FAIL_TO_BLE_S) {
             return JIANLU_AUTO_TO_BLE;
@@ -17,8 +19,9 @@ jianlu_auto_action_t jianlu_auto_decide(const jianlu_auto_input_t *in)
         return JIANLU_AUTO_STAY;
     }
 
-    // BLE 态:手动强制 → 常驻
-    if (in->ble_locked) return JIANLU_AUTO_STAY;
+    // BLE 态:手动档(Wi-Fi/蓝牙直连)→ 不自动退出(手动 Wi-Fi 档本就不该
+    // 出现在 BLE 态,防御性常驻;切换由设置页重启完成)
+    if (in->cmode != JIANLU_CMODE_AUTO) return JIANLU_AUTO_STAY;
     // 桥已连接 → 常驻(最省电最稳)
     if (in->ble_connected) return JIANLU_AUTO_STAY;
     // 空闲够久且有 Wi-Fi 凭据 → 回 Wi-Fi 试探(人可能挪了位置)

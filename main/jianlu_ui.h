@@ -104,9 +104,9 @@ void jianlu_ui_home_focus(int focus);   // 0 简录 1 二维码 2 设置
 // 无二维码时白卡内显示引导文案。
 void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof);
 
-// 设置页:焦点行 + 亮度百分比 + 常亮开关 + 当前主题名
+// 设置页:焦点行 + 亮度百分比 + 常亮开关 + 当前主题名 + 连接方式(三档)
 void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
-                            int theme_id, bool dlink_on);
+                            int theme_id, int cmode);
 
 // ---- 色彩主题 ----
 int jianlu_ui_theme(void);              // 当前主题 id

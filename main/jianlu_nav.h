@@ -4,7 +4,7 @@
 // 规则(v2 产品定义):
 //   主页:UP/DOWN 移菜单焦点(三格循环),OK 单击进入,OK 双击无操作
 //   子页:OK 双击回主页
-//   设置页:UP/DOWN 移焦点(四行循环),OK 单击 = 触发当前行动作
+//   设置页:UP/DOWN 移焦点(七行循环),OK 单击 = 触发当前行动作
 //           (亮度行 OK 循环调档 25/50/75/100,避免"亮度行吃掉 UP/DOWN
 //           移不出焦点"的死角)
 //   简录页:UP/DOWN/OK 由卡片堆逻辑处理(本模块 NO_CHANGE 放行)
@@ -22,7 +22,7 @@ typedef enum {
 typedef struct {
     jianlu_page_t page;
     int home_focus;      // 0 简录 1 二维码 2 设置
-    int settings_focus;  // 0 亮度 1 立即同步 2 关于 3 重新配网
+    int settings_focus;  // 0 亮度 1 主题 2 常亮 3 连接方式 4 立即同步 5 重新配网 6 关于
 } jianlu_nav_t;
 
 typedef enum {
@@ -45,7 +45,7 @@ jianlu_page_t jianlu_nav_home_target(int focus);
 #define JIANLU_SETTINGS_ROW_BRIGHTNESS 0   // 屏幕亮度(OK 循环调档)
 #define JIANLU_SETTINGS_ROW_THEME     1   // 色彩主题(OK 循环切换)
 #define JIANLU_SETTINGS_ROW_KEEPON    2   // 屏幕常亮(OK 开关)
-#define JIANLU_SETTINGS_ROW_DLINK     3   // BLE 直连(OK 切换,重启生效)
+#define JIANLU_SETTINGS_ROW_CMODE     3   // 连接方式(OK 循环 自动/Wi-Fi/蓝牙,重启生效)
 #define JIANLU_SETTINGS_ROW_SYNC      4   // 立即同步
 #define JIANLU_SETTINGS_ROW_REPROV    5   // 重新配网
 #define JIANLU_SETTINGS_ROW_ABOUT     6   // 关于(最后一项)

@@ -8,7 +8,7 @@ static jianlu_auto_input_t base_wifi(void)
 {
     jianlu_auto_input_t in = {
         .in_ble = false,
-        .ble_locked = false,
+        .cmode = JIANLU_CMODE_AUTO,
         .ble_connected = false,
         .wifi_has_creds = true,
         .busy = false,
@@ -47,6 +47,11 @@ static void test_wifi_to_ble(void) {
     // 中枢可达(计数归零)→ 不切
     in.hub_unreachable_s = 0;
     assert(jianlu_auto_decide(&in) == JIANLU_AUTO_STAY);
+
+    // 手动 Wi-Fi 档:中枢失联再久也不自动转 BLE
+    in.cmode = JIANLU_CMODE_WIFI;
+    in.hub_unreachable_s = 99999;
+    assert(jianlu_auto_decide(&in) == JIANLU_AUTO_STAY);
 }
 
 static void test_ble_stay_and_exit(void) {
@@ -54,12 +59,12 @@ static void test_ble_stay_and_exit(void) {
     in.in_ble = true;
     in.ble_idle_s = JIANLU_AUTO_BLE_IDLE_TO_WIFI_S + 1;
 
-    // 手动强制 BLE:即使空闲再久也不退
-    in.ble_locked = true;
+    // 手动蓝牙直连档:即使空闲再久也不退(旧 dlock 锁不生效的回归)
+    in.cmode = JIANLU_CMODE_BLE;
     assert(jianlu_auto_decide(&in) == JIANLU_AUTO_STAY);
 
     // 桥已连接:常驻
-    in.ble_locked = false;
+    in.cmode = JIANLU_CMODE_AUTO;
     in.ble_connected = true;
     assert(jianlu_auto_decide(&in) == JIANLU_AUTO_STAY);
 

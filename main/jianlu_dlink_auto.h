@@ -1,15 +1,18 @@
 // main/jianlu_dlink_auto.h —— 双模式自动切换决策(纯 C,host 可测)。
 //
-// 语义(用户拍板 A 方案,BLE 优先):
-//   有 Wi-Fi 凭据开机默认 Wi-Fi(现状全保留);
-//   Wi-Fi 态中枢连续不可达 ≥2 分钟(且空闲)→ 自动转 BLE;
-//   BLE 态桥已连接 → 常驻;BLE 空闲(无连接)≥5 分钟且有 Wi-Fi 凭据 → 回 Wi-Fi;
-//   手动「直连模式」= 强制 BLE 常驻(ble_locked),自动退出被禁止;
+// 语义(连接方式三档,见 jianlu_config.h 的 jianlu_cmode_t):
+//   自动档:有 Wi-Fi 凭据开机默认 Wi-Fi(现状全保留);
+//     Wi-Fi 态中枢连续不可达 ≥2 分钟(且空闲)→ 自动转 BLE;
+//     BLE 态桥已连接 → 常驻;BLE 空闲(无连接)≥5 分钟且有 Wi-Fi 凭据 → 回 Wi-Fi;
+//   Wi-Fi 中枢档:永不自动转 BLE;
+//   蓝牙直连档:常驻 BLE,自动退出被禁止;
 //   每模式最短驻留 5 分钟(防抖);录音/上传等忙时不切换。
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "jianlu_config.h"
 
 #define JIANLU_AUTO_HUB_FAIL_TO_BLE_S  120   // Wi-Fi 态中枢不可达→BLE
 #define JIANLU_AUTO_BLE_IDLE_TO_WIFI_S 300   // BLE 空闲→Wi-Fi(试新位置)
@@ -23,7 +26,7 @@ typedef enum {
 
 typedef struct {
     bool in_ble;            // 当前 BLE 模式
-    bool ble_locked;        // 手动强制 BLE(设置页开启)
+    uint8_t cmode;          // 连接方式(jianlu_cmode_t):手动档禁止自动切换
     bool ble_connected;     // BLE 态:桥已连接
     bool wifi_has_creds;    // 存有 Wi-Fi 凭据
     bool busy;              // 录音/上传/同步进行中

@@ -26,8 +26,11 @@ typedef struct {
     uint64_t avatar_ver;     // 已缓存头像的中枢版本(0=未缓存)
     uint64_t qrcode_ver;
     uint8_t reprov;          // 强制配网标志:置位后开机必进配网态(即使有凭据)
-    uint8_t dmode;           // BLE 直连模式:置位后开机不起 Wi-Fi,起 NUS 服务
-    uint8_t dlock;           // 手动强制 BLE 常驻(自动退出被禁止)
+    uint8_t dmode;           // 当前处于 BLE 直连态(自动引擎也会写;cmode 语义见 jianlu_config.h)
+    uint8_t dlock;           // 废弃:旧版"手动强制 BLE"锁,仅用于迁移到 cmode
+    uint8_t cmode;           // 连接方式 0=自动 1=Wi-Fi 中枢 2=蓝牙直连(jianlu_cmode_t)
+    uint8_t cmode_pend;      // 待验证切换:回滚目标档位(0xFF=无;Wi-Fi→蓝牙须重启验证)
+    uint8_t cmode_fail;      // 回滚后待展示的失败原因码(0=无;进 Wi-Fi 态提示后清零)
 } jianlu_nvs_data_t;
 
 // 读取全部已知 key 到 data(缺失的 key 置空串)。NVS 未初始化返回错误。
@@ -47,9 +50,13 @@ esp_err_t jianlu_nvs_clear_provisioning(void);
 // 强制配网标志(重配确认时置 1;BLUFI 收到新凭据时清 0)。
 // 语义:重配 = 强制走配网,即使 Kconfig/NVS 还有旧凭据。
 esp_err_t jianlu_nvs_save_reprov(uint8_t on);
-// BLE 直连模式标志(设置页切换,重启生效)
+// BLE 直连态标志(设置页切换/自动引擎写入,重启生效)
 esp_err_t jianlu_nvs_save_dmode(uint8_t on);
-esp_err_t jianlu_nvs_save_dlock(uint8_t on);
+// 连接方式(0=自动 1=Wi-Fi 2=蓝牙直连;设置页三档,重启生效)
+esp_err_t jianlu_nvs_save_cmode(uint8_t cmode);
+// 待验证切换的回滚档位(0xFF=无)与回滚后的失败原因码(0=无)
+esp_err_t jianlu_nvs_save_cmode_pend(uint8_t pend);
+esp_err_t jianlu_nvs_save_cmode_fail(uint8_t reason);
 
 // 配网成功落盘:凭据写入 + 强制标志清除,同一事务(单次 commit)。
 // 修复"两笔独立提交间掉电/失败 → 有凭据但标志在位 → 永远强制配网"。

@@ -38,6 +38,7 @@
 #include "freertos/task.h"
 #include "jianlu_capture.h"
 #include "jianlu_config.h"
+#include "lvgl.h"   // lv_mem_monitor(池水位告警)
 #include "jianlu_discover.h"
 #include "jianlu_home.h"
 #include "jianlu_hub.h"
@@ -97,6 +98,7 @@ typedef enum {
     EV_PROFILE_DONE,     // 网络任务:资料拉取(arg1=esp_err)
     EV_AVATAR_DONE,      // 网络任务:头像下载(arg1=esp_err)
     EV_QR_DONE,          // 网络任务:二维码下载(arg1=esp_err)
+    EV_CMODE_TEST,       // 连接方式测试任务结束(arg1=esp_err,arg2=失败原因码)
 } app_ev_type_t;
 
 typedef struct {
@@ -164,7 +166,12 @@ static int s_brightness = 100;          // 25/50/75/100
 static bool s_keep_on;                  // 屏幕常亮
 static bool s_info_shown;               // 「关于」信息页显示中
 static bool s_dlink_mode;               // 当前运行于 BLE 直连模式
-static bool s_dlink_locked;             // 手动强制 BLE 常驻
+// 连接方式「先测后切」状态:测试进行中冻结按键/自动切换/Wi-Fi 事件副作用
+static volatile bool s_cmode_testing;
+static uint8_t s_cmode_target;          // 测试目标档位(JIANLU_CMODE_*)
+static volatile bool s_dlink_got_push;  // 直连首条推送到达(time/profile 回调置位)
+static int s_pend_ticks;                // 待验证切换的节拍计数(90s 回滚用)
+static void cmode_test_begin(uint8_t next);
 // 自动切换观测量
 static uint32_t s_hub_unreachable_s;    // Wi-Fi 态:中枢连续不可达秒数
 static uint32_t s_ble_idle_s;           // BLE 态:桥未连接秒数
@@ -343,22 +350,28 @@ static esp_err_t wifi_set_creds(const char *ssid, const char *pass)
     return esp_wifi_set_config(WIFI_IF_STA, &sta);
 }
 
+static bool s_wifi_stack_ready;   // netif/事件循环/回调只建一次(测试回滚会重复进 wifi_start)
+
 static esp_err_t wifi_start(void)
 {
-    esp_err_t err = esp_netif_init();
-    if (err != ESP_OK) return err;
-    err = esp_event_loop_create_default();
-    if (err != ESP_OK) return err;
-    esp_netif_create_default_wifi_sta();
+    esp_err_t err;
+    if (!s_wifi_stack_ready) {
+        err = esp_netif_init();
+        if (err != ESP_OK) return err;
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK) return err;
+        esp_netif_create_default_wifi_sta();
+        err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                  on_wifi_event, NULL, NULL);
+        if (err != ESP_OK) return err;
+        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                  on_wifi_event, NULL, NULL);
+        if (err != ESP_OK) return err;
+        s_wifi_stack_ready = true;
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
-    if (err != ESP_OK) return err;
-    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                              on_wifi_event, NULL, NULL);
-    if (err != ESP_OK) return err;
-    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                              on_wifi_event, NULL, NULL);
     if (err != ESP_OK) return err;
     // 凭据由本应用自管(NVS/Kconfig/BLUFI),不让 IDF 另存一份造成双事实源
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -374,11 +387,14 @@ static esp_err_t wifi_start(void)
     err = esp_wifi_start();
     if (err != ESP_OK) return err;
 
-    esp_timer_create_args_t timer_args = {
-        .callback = wifi_retry_cb,
-        .name = "wifi_retry",
-    };
-    return esp_timer_create(&timer_args, &s_retry_timer);
+    if (!s_retry_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback = wifi_retry_cb,
+            .name = "wifi_retry",
+        };
+        return esp_timer_create(&timer_args, &s_retry_timer);
+    }
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +664,10 @@ static void refresh_home(void)
         jianlu_ui_home_set(&s_profile, &model,
                            jianlu_hub_cache_exists(AVATAR_PATH));
         bsp_lvgl_unlock();
+    } else {
+        // 锁超时会让主页静默停留在旧内容——这是"数据到了屏幕不更新"的
+        // 唯一可见信号,保留告警(正常不应发生)
+        ESP_LOGW(TAG, "refresh_home: LVGL 锁超时,主页未刷新");
     }
 }
 
@@ -678,7 +698,7 @@ static void switch_page(void)
     case JIANLU_PAGE_SETTINGS:
         if (bsp_lvgl_lock(500)) {
             jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
-                                   s_keep_on, jianlu_ui_theme(), s_dlink_mode);
+                                   s_keep_on, jianlu_ui_theme(), s_nvs.cmode);
             bsp_lvgl_unlock();
         }
         break;
@@ -705,7 +725,7 @@ static void settings_refresh(void)
 {
     if (s_nav.page == JIANLU_PAGE_SETTINGS && bsp_lvgl_lock(500)) {
         jianlu_ui_settings_set(s_nav.settings_focus, s_brightness, s_keep_on,
-                               jianlu_ui_theme(), s_dlink_mode);
+                               jianlu_ui_theme(), s_nvs.cmode);
         bsp_lvgl_unlock();
     }
 }
@@ -775,20 +795,27 @@ static void settings_action(void)
         ESP_LOGI(TAG, "色彩主题: %s", jianlu_theme_name(next));
         break;
     }
-    case JIANLU_SETTINGS_ROW_DLINK:
-        // 手动开 = 强制 BLE 常驻(dlock);再按 = 两者全清回 Wi-Fi 自动
-        if (s_dlink_mode) {
-            jianlu_nvs_save_dmode(0);
-            jianlu_nvs_save_dlock(0);
-            ESP_LOGI(TAG, "直连关闭,重启回 Wi-Fi 模式");
-        } else {
-            jianlu_nvs_save_dmode(1);
-            jianlu_nvs_save_dlock(1);
-            ESP_LOGI(TAG, "直连开启(强制 BLE 常驻),重启生效");
+    case JIANLU_SETTINGS_ROW_CMODE: {
+        // 连接方式三档循环:自动 → Wi-Fi 中枢 → 蓝牙直连。
+        // 自动档自带回退引擎直接切;手动档「先测后切」——连通才提交重启,
+        // 不通原地不动(否则切过去连不上,卡片直接变砖块体验)。
+        uint8_t next = (uint8_t)((s_nvs.cmode + 1) % 3);
+        if (next != JIANLU_CMODE_AUTO) {
+            cmode_test_begin(next);
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(300));
+        jianlu_nvs_save_cmode(next);
+        jianlu_nvs_save_cmode_pend(0xFF);   // 防御:自动档直切,清掉历史遗留
+        ESP_LOGI(TAG, "连接方式: %s,重启生效", jianlu_cmode_name(next));
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_flash("连接方式", jianlu_ui_accent(),
+                                    jianlu_cmode_name(next));
+            bsp_lvgl_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(600));
         esp_restart();
         break;
+    }
     case JIANLU_SETTINGS_ROW_KEEPON:
         keepon_toggle();
         break;
@@ -814,7 +841,7 @@ static void settings_action(void)
         case JIANLU_SYNC_WAIT_BLE:
             // 直连 + 未连接:同步由电脑端桥完成,这里只提示
             if (bsp_lvgl_lock(500)) {
-                jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
+                jianlu_ui_overlay_flash("蓝牙直连", jianlu_ui_accent(),
                                         "等待电脑连接中");
                 bsp_lvgl_unlock();
             }
@@ -902,6 +929,7 @@ static esp_err_t wifi_teardown(void)
 {
     esp_wifi_disconnect();
     esp_wifi_stop();
+    s_wifi_connected = false;   // 不等异步事件:测试任务紧接着要轮询该标志
     return esp_wifi_deinit();
 }
 
@@ -1168,7 +1196,7 @@ static void on_key_event(const app_ev_t *ev)
     bool gesture_end = ev->btn_ev != BSP_BTN_PRESS;
     if (jianlu_ps_key(&s_ps, gesture_end)) {
         if (s_screen_off) {
-            bsp_display_backlight(100);
+            bsp_display_backlight((uint8_t)s_brightness);   // 唤醒恢复用户亮度
             s_screen_off = false;
         }
         return;
@@ -1257,8 +1285,8 @@ static void on_key_event(const app_ev_t *ev)
         if (s_dlink_mode) {
             // 直连态无 Wi-Fi 凭据概念:重配无意义,只提示(不清直连标志)
             if (bsp_lvgl_lock(500)) {
-                jianlu_ui_overlay_flash("直连模式", jianlu_ui_accent(),
-                                        "无需配网:关闭直连后可用");
+                jianlu_ui_overlay_flash("蓝牙直连中", jianlu_ui_accent(),
+                                        "配网请先把连接方式设为 Wi-Fi");
                 bsp_lvgl_unlock();
             }
             return;
@@ -1299,7 +1327,7 @@ static void on_key_event(const app_ev_t *ev)
                 jianlu_ui_home_focus(s_nav.home_focus);
             } else if (s_nav.page == JIANLU_PAGE_SETTINGS) {
                 jianlu_ui_settings_set(s_nav.settings_focus, s_brightness,
-                                       s_keep_on, jianlu_ui_theme(), s_dlink_mode);
+                                       s_keep_on, jianlu_ui_theme(), s_nvs.cmode);
             }
             bsp_lvgl_unlock();
         }
@@ -1385,7 +1413,7 @@ static void light_sleep_once(void)
     // 醒后恢复按键 ADC(bsp_button_init 可重复调用)
     bsp_button_init(on_key, NULL);
     jianlu_ps_woke(&s_ps);
-    bsp_display_backlight(100);
+    bsp_display_backlight((uint8_t)s_brightness);   // 唤醒恢复用户亮度
     s_screen_off = false;
     ESP_LOGI(TAG, "已唤醒");
     ui_refresh(JIANLU_ANIM_NONE);
@@ -1418,6 +1446,7 @@ static void dlink_time_cb(int64_t epoch)
     // 纯系统调用,可在主机任务直接做;对时后录音时间戳/主页时钟不再停摆
     struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
     settimeofday(&tv, NULL);
+    s_dlink_got_push = true;   // 连接方式测试:首条推送 = 桥链路整通
     ESP_LOGI(TAG, "直连对时 epoch=%lld", (long long)epoch);
 }
 
@@ -1427,6 +1456,7 @@ static void dlink_profile_cb(const char *nickname, const char *signature)
                      sizeof(s_dlink_nick) - 1);
     jianlu_utf8_copy(s_dlink_sign, sizeof(s_dlink_sign), signature,
                      sizeof(s_dlink_sign) - 1);
+    s_dlink_got_push = true;
     post_event(EV_DLINK_PROFILE, 0, 0, NULL);
 }
 
@@ -1435,13 +1465,225 @@ static void dlink_img_cb(bool avatar, bool ok)
     post_event(EV_DLINK_IMG, avatar ? 1 : 0, ok ? 1 : 0, NULL);
 }
 
+// 直连接线(开机 BLE 分支与连接方式测试共用):清单绑定 + 三类回调 + 待同步
+static void dlink_wire(void)
+{
+    jianlu_dlink_bind(&s_store, dlink_ui_refresh_cb);
+    jianlu_dlink_set_pdone_cb(dlink_pdone_cb);
+    jianlu_dlink_set_app_cbs(dlink_time_cb, dlink_profile_cb, dlink_img_cb);
+    jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
+}
+
+// ---- 连接方式「先测后切」 -------------------------------------------------
+// 切档不再直接写 NVS 重启:先在当前运行时状态里搭起目标链路验证连通,
+// 通过才提交(写 cmode/dmode → 重启);失败回滚原链路,模式与内容都不动。
+// 两种电台内存互斥(无 PSRAM),测试期必须互让:
+//   测 Wi-Fi = 停 NimBLE → 连 Wi-Fi → 发现中枢 → HTTP 探活;
+//   测蓝牙   = 卸 Wi-Fi → 起 NimBLE 广播 → 等中继连接并收首条推送。
+
+#define CT_FAIL_NO_CREDS   1   // 无 Wi-Fi 凭据
+#define CT_FAIL_WIFI       2   // 连不上路由器
+#define CT_FAIL_NO_HUB     3   // 找不到中枢
+#define CT_FAIL_HUB_HTTP   4   // 中枢无响应
+#define CT_FAIL_NIMBLE     5   // BLE 栈启动失败(内存不足)
+#define CT_FAIL_NO_BRIDGE  6   // 超时未检测到电脑
+
+static const char *cmode_fail_reason(int r)
+{
+    static const char *const REASONS[] = {
+        "未知原因",
+        "无 Wi-Fi 凭据\n请先用蓝牙配网",          // CT_FAIL_NO_CREDS
+        "连不上 Wi-Fi\n请检查路由器",            // CT_FAIL_WIFI
+        "找不到中枢\n请确认电脑中枢已启动",       // CT_FAIL_NO_HUB
+        "中枢无响应",                           // CT_FAIL_HUB_HTTP
+        "蓝牙启动失败\n请重启后再试",            // CT_FAIL_NIMBLE
+        "未检测到电脑\n请确认电脑中枢已启动",     // CT_FAIL_NO_BRIDGE
+    };
+    return (r >= 1 && r <= 6) ? REASONS[r] : REASONS[0];
+}
+
+static bool test_wait_flag(volatile bool *flag, int timeout_ms)
+{
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (*flag) return true;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    return *flag;
+}
+
+// 测 Wi-Fi 中枢链路(直连态下调用)。返回 ESP_OK = 全链路通。
+static esp_err_t test_wifi_link(int *reason)
+{
+    if (s_nvs.wifi_ssid[0] == '\0') { *reason = CT_FAIL_NO_CREDS; return ESP_FAIL; }
+    jianlu_dlink_stop();   // 内存互斥:Wi-Fi 初始化 ~40K,必须先释放 NimBLE
+    esp_err_t err = wifi_start();
+    if (err == ESP_OK) err = wifi_set_creds(s_nvs.wifi_ssid, s_nvs.wifi_pass);
+    if (err != ESP_OK) { *reason = CT_FAIL_WIFI; return err; }
+    wifi_connect();
+    if (!test_wait_flag(&s_wifi_connected, 12000)) {
+        *reason = CT_FAIL_WIFI;
+        return ESP_ERR_TIMEOUT;
+    }
+    // 中枢地址与 on_got_ip 同优先级:Kconfig 开发覆盖 > mDNS > NVS 缓存兜底
+    char url[JIANLU_HUB_URL_LEN] = { 0 };
+    if (jianlu_config_pick_hub(CONFIG_XIAONUO_HUB_URL, NULL, NULL)
+        == JIANLU_HUB_KCONFIG) {
+        jianlu_utf8_copy(url, sizeof(url), CONFIG_XIAONUO_HUB_URL,
+                         sizeof(url) - 1);
+    } else if (jianlu_discover_hub(url, sizeof(url), MDNS_TIMEOUT_MS)
+               != ESP_OK) {
+        if (jianlu_config_pick_hub(NULL, NULL, s_nvs.hub_url)
+            != JIANLU_HUB_NVS) {
+            *reason = CT_FAIL_NO_HUB;
+            return ESP_ERR_NOT_FOUND;
+        }
+        jianlu_utf8_copy(url, sizeof(url), s_nvs.hub_url, sizeof(url) - 1);
+    }
+    jianlu_hub_set_base(url);
+    ESP_LOGI(TAG, "测试: 探活中枢 %s", url);
+    err = jianlu_hub_fetch_profile(&s_profile_tmp);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "测试: 探活失败 %s", esp_err_to_name(err));
+        *reason = CT_FAIL_HUB_HTTP;
+        return err;
+    }
+    return ESP_OK;
+}
+
+// 测蓝牙直连链路(Wi-Fi 态下调用)。**不存在原地测试**:NimBLE 起栈需 ~58K
+// 空闲堆,Wi-Fi 态(音频 DMA+工作任务常驻)拆掉 Wi-Fi 驱动也只腾得出 ~42K
+// (实测 hci init 失败)——物理上放不下两套栈。该方向走「重启验证+自动回滚」,
+// 见 cmode_test_begin。
+
+static void cmode_test_task(void *arg)
+{
+    (void)arg;
+    esp_err_t err;
+    int reason = 0;
+    // 目标 Wi-Fi 中枢:原地测试(直连态先停 NimBLE 让出内存)
+    if (!s_dlink_mode) {
+        // 已在 Wi-Fi 态(自动档切手动档):链路就在,同步探活即可
+        if (jianlu_hub_base()[0] == '\0' && s_nvs.hub_url[0] != '\0') {
+            jianlu_hub_set_base(s_nvs.hub_url);   // 与正常路径的 NVS 兜底一致
+        }
+        if (jianlu_hub_base()[0] == '\0') {
+            err = ESP_ERR_NOT_FOUND;
+            reason = CT_FAIL_NO_HUB;
+        } else {
+            err = jianlu_hub_fetch_profile(&s_profile_tmp);
+            if (err != ESP_OK) reason = CT_FAIL_HUB_HTTP;
+        }
+    } else {
+        err = test_wifi_link(&reason);
+        if (err != ESP_OK) {
+            // 回滚:关 Wi-Fi,拉起直连(栈曾成功起过,再起应无碍)
+            wifi_teardown();
+            jianlu_dlink_start();
+        }
+    }
+    ESP_LOGI(TAG, "连接方式测试%s: 目标 %s 原因 %d",
+             err == ESP_OK ? "通过" : "失败", jianlu_cmode_name(s_cmode_target),
+             reason);
+    post_event(EV_CMODE_TEST, (int32_t)err, reason, NULL);
+    vTaskDelete(NULL);
+}
+
+static void cmode_test_begin(uint8_t next)
+{
+    if (s_cmode_testing) return;
+    if (next == JIANLU_CMODE_BLE) {
+        // Wi-Fi→蓝牙:NimBLE 起栈 ~58K,Wi-Fi 态腾不出(实测),无法原地测试。
+        // 改「重启验证 + 90s 自动回滚」:记下回滚档位后重启进直连,
+        // 90s 内桥连上并推来数据才生效,否则自动切回原档位——
+        // 用户永远不会被丢在一个连不上的模式里。
+        if (s_dlink_mode) return;   // 已是蓝牙直连
+        ESP_LOGI(TAG, "连接方式: 蓝牙直连(重启验证,90s 未连通回滚 %s)",
+                 jianlu_cmode_name(s_nvs.cmode));
+        jianlu_nvs_save_cmode_pend(s_nvs.cmode);
+        jianlu_nvs_save_cmode(JIANLU_CMODE_BLE);
+        jianlu_nvs_save_dmode(1);
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_flash("切换蓝牙直连", jianlu_ui_accent(),
+                                    "重启验证:90 秒内\n连不上电脑自动切回");
+            bsp_lvgl_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+    }
+    // 目标 Wi-Fi 中枢:原地测试(连通才提交)
+    s_cmode_testing = true;
+    s_cmode_target = next;
+    ESP_LOGI(TAG, "连接方式测试开始: 目标 %s(空闲堆 %u)",
+             jianlu_cmode_name(next), (unsigned)esp_get_free_heap_size());
+    if (bsp_lvgl_lock(500)) {
+        jianlu_ui_overlay("测试连接中", jianlu_ui_accent(),
+                          "正在连接 Wi-Fi 中枢…", "约需 15 秒");
+        bsp_lvgl_unlock();
+    }
+    // 栈对齐 net_task(同样跑 HTTP/mDNS)
+    if (xTaskCreate(cmode_test_task, "cmode_test", 5120, NULL, 4, NULL)
+        != pdPASS) {
+        s_cmode_testing = false;
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_hide();
+            jianlu_ui_overlay_flash("切换失败", jianlu_ui_accent(),
+                                    "系统资源不足,请重启后再试");
+            bsp_lvgl_unlock();
+        }
+    }
+}
+
 static void on_auto_tick(void)
 {
     static int tick_n;
     tick_n++;
 
+    // 待验证的蓝牙切换(Wi-Fi→蓝牙是重启验证制):90s 内桥推来数据才生效,
+    // 否则自动回滚原档位。6 个节拍 = 90s。只在直连运行态验证(Wi-Fi 态
+    // 永远收不到桥推送,会把历史遗留的 pend 误判超时)。
+    if (s_dlink_mode && s_nvs.cmode_pend != 0xFF) {
+        if (s_dlink_got_push) {
+            ESP_LOGI(TAG, "蓝牙直连验证通过,切换生效");
+            jianlu_nvs_save_cmode_pend(0xFF);
+            s_nvs.cmode_pend = 0xFF;
+            if (bsp_lvgl_lock(500)) {
+                jianlu_ui_overlay_flash("蓝牙直连", jianlu_ui_accent(),
+                                        "已连接电脑,切换生效");
+                bsp_lvgl_unlock();
+            }
+        } else if (++s_pend_ticks >= 6) {
+            ESP_LOGW(TAG, "蓝牙直连验证超时,自动回滚");
+            jianlu_nvs_save_cmode_fail(CT_FAIL_NO_BRIDGE);
+            jianlu_nvs_save_cmode(s_nvs.cmode_pend);
+            jianlu_nvs_save_dmode(0);
+            jianlu_nvs_save_cmode_pend(0xFF);
+            esp_restart();
+        }
+    }
+
+    // LVGL 池水位告警:池耗尽时分配静默失败,文字退化成 "Text" 占位(实测)。
+    // 平时零日志,用量超 85% 才报警——早期发现此类问题的唯一信号。
+    {
+        lv_mem_monitor_t mon;
+        lv_mem_monitor(&mon);
+        if (mon.used_pct > 85) {
+            ESP_LOGW(TAG, "LVGL池水位高: 总%u 空%u 峰值%u (%u%%)",
+                     (unsigned)mon.total_size, (unsigned)mon.free_size,
+                     (unsigned)mon.max_used, (unsigned)mon.used_pct);
+        }
+    }
+
     bool busy = s_voice.state != JIANLU_VOICE_IDLE || s_drain_active ||
                 s_playing || s_prov_running;
+
+    // 直连心跳:桥侧靠它识别"会话已死"(卡片重启后 CoreBluetooth 可能仍报
+    // 已连接,中继通知流静默僵死——实测)。15s 一条,仅连接时发送。
+    if (s_dlink_mode && jianlu_dlink_connected()) {
+        jianlu_dlink_send_line("{\"r\":\"hb\"}");
+    }
+
+    if (s_cmode_testing) return;   // 连接测试期电台互让,观测量无效不决策
 
     if (s_dlink_mode) {
         if (jianlu_dlink_connected()) {
@@ -1451,7 +1693,7 @@ static void on_auto_tick(void)
         }
         jianlu_auto_input_t in = {
             .in_ble = true,
-            .ble_locked = s_dlink_locked,
+            .cmode = s_nvs.cmode,
             .ble_connected = jianlu_dlink_connected(),
             .wifi_has_creds = s_nvs.wifi_ssid[0] != '\0',
             .busy = busy,
@@ -1467,7 +1709,7 @@ static void on_auto_tick(void)
         }
         jianlu_auto_input_t in = {
             .in_ble = false,
-            .ble_locked = s_dlink_locked,
+            .cmode = s_nvs.cmode,
             .wifi_has_creds = s_nvs.wifi_ssid[0] != '\0',
             .busy = busy,
             .mode_dwell_s = (uint32_t)(esp_timer_get_time() / 1000000ULL),
@@ -1509,12 +1751,11 @@ static void app_task(void *arg)
     app_ev_t ev;
     for (;;) {
         esp_task_wdt_reset();
-        // 省电:忙(录音/上传/配网/回放)不累计空闲
-        // 直连模式常置忙:light sleep 会杀 BLE 广播/连接(USB 也随之中断),
-        // 熄屏不受影响;Wi-Fi 模式保持原有休眠策略
+        // 省电:忙(录音/配网/回放)与直连只禁 light sleep——light sleep 会杀
+        // BLE 广播/连接(USB 也随之中断);熄屏只是关背光,忙时照常生效
         jianlu_ps_set_busy(&s_ps,
             s_voice.state != JIANLU_VOICE_IDLE || s_prov_running || s_playing ||
-            s_dlink_mode);
+            s_dlink_mode || s_cmode_testing);   // 测试期保持屏幕亮着看进度
         if (xQueueReceive(s_ev_queue, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) {
             switch (jianlu_ps_tick(&s_ps)) {
             case JIANLU_PS_ACT_SCREEN_OFF:
@@ -1532,9 +1773,11 @@ static void app_task(void *arg)
         }
         switch (ev.type) {
         case EV_KEY:
+            if (s_cmode_testing) break;   // 连接测试中冻结按键
             on_key_event(&ev);
             break;
         case EV_WIFI_CONNECTED:
+            if (s_cmode_testing) break;   // 测试任务自管连接,不走正常流程
             ESP_LOGI(TAG, "Wi-Fi 已连接");
             on_got_ip();
 #if VOICE_LINK_SELFTEST
@@ -1546,6 +1789,7 @@ static void app_task(void *arg)
 #endif
             break;
         case EV_WIFI_DISCONNECTED:
+            if (s_cmode_testing) break;   // 测试期主动卸载 Wi-Fi 会触发本事件
             if (s_nf == JIANLU_NF_READY) {
                 ESP_LOGW(TAG, "Wi-Fi 掉线,%dms 后重连", WIFI_RETRY_MS);
                 jianlu_netflow_event(&s_nf, JIANLU_NF_DISCONNECT);
@@ -1870,6 +2114,41 @@ static void app_task(void *arg)
                 bsp_lvgl_unlock();
             }
             break;
+        case EV_CMODE_TEST:
+            if ((esp_err_t)ev.arg1 == ESP_OK) {
+                // 测试通过才提交:写 cmode/dmode → 重启进目标模式
+                jianlu_nvs_save_cmode(s_cmode_target);
+                jianlu_nvs_save_dmode(s_cmode_target == JIANLU_CMODE_BLE ? 1 : 0);
+                jianlu_nvs_save_cmode_pend(0xFF);   // 防御:清掉历史遗留
+                ESP_LOGI(TAG, "连接方式: %s(测试通过),重启生效",
+                         jianlu_cmode_name(s_cmode_target));
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_hide();
+                    jianlu_ui_overlay_flash("连接成功", jianlu_ui_accent(),
+                                            jianlu_cmode_name(s_cmode_target));
+                    bsp_lvgl_unlock();
+                }
+                vTaskDelay(pdMS_TO_TICKS(800));
+                esp_restart();
+            } else {
+                // 失败:模式与内容不动,提示原因;测试任务已回滚电台
+                const char *reason = cmode_fail_reason((int)ev.arg2);
+                ESP_LOGW(TAG, "切换失败(保持原方式): %s", reason);
+                s_cmode_testing = false;
+                if (bsp_lvgl_lock(500)) {
+                    jianlu_ui_overlay_hide();
+                    jianlu_ui_overlay_flash("切换失败,保持原方式",
+                                            jianlu_ui_accent(), reason);
+                    bsp_lvgl_unlock();
+                }
+                // Wi-Fi 态回滚后补中枢发现(GOT_IP 在测试期被冻结)
+                if (!s_dlink_mode) {
+                    if (s_wifi_connected) on_got_ip();
+                    else wifi_connect();
+                }
+                settings_refresh();
+            }
+            break;
         }
     }
 }
@@ -1921,9 +2200,9 @@ void jianlu_app_start(void)
         return;
     }
 
-    // 启动模式决策(纯函数,host 测试矩阵覆盖):直连 > 强制配网 > 凭据联网
-    // > 出厂配网。直连(BLE-only)不需要 Wi-Fi 凭据——dmode 在位时无论凭据
-    // 状态一律进 BLE,配网页只属于"Wi-Fi 模式且无凭据"。
+    // 启动模式决策(纯函数,host 测试矩阵覆盖):蓝牙直连档 > 强制配网 > 凭据联网
+    // > 出厂配网。直连(BLE-only)不需要 Wi-Fi 凭据——cmode=BLE(或自动档且
+    // dmode 在位)时无论凭据状态一律进 BLE,配网页只属于"Wi-Fi 侧且无凭据"。
     jianlu_wifi_src_t wifi_src = jianlu_config_pick_wifi(s_nvs.wifi_ssid,
                                                          CONFIG_XIAONUO_WIFI_SSID);
     const char *ssid = wifi_src == JIANLU_WIFI_NVS ? s_nvs.wifi_ssid
@@ -1933,10 +2212,11 @@ void jianlu_app_start(void)
                      : wifi_src == JIANLU_WIFI_KCONFIG ? CONFIG_XIAONUO_WIFI_PASSWORD
                      : "";
 
-    switch (jianlu_config_boot_mode(s_nvs.dmode, s_nvs.reprov, wifi_src)) {
+    switch (jianlu_config_boot_mode(s_nvs.cmode, s_nvs.dmode, s_nvs.reprov,
+                                    wifi_src)) {
     case JIANLU_BOOT_BLE: {
         // BLE 直连模式:与 Wi-Fi 互斥(内存),起 NUS 服务端;
-        // 设置页「直连模式」再按一次回 Wi-Fi(重启切换)。
+        // 设置页「连接方式」可切回 Wi-Fi/自动(重启切换)。
         // 注意:NimBLE 全量初始化吃 ~74K(音频 DMA 8K + 网络/录音任务 9K
         // 放不进来,实测任务创建失败/互斥量断言),直连态不做语音录音,
         // 语音槽由 Wi-Fi 态录制、直连态由桥 vget 拉取(voicefs 持久)。
@@ -1946,10 +2226,7 @@ void jianlu_app_start(void)
         // 不走 netflow NO_CREDS:那会把视图切成配网页。直连态就是正常
         // 界面(空清单 + 「直连」标识),清单由桥推送到达。
         jianlu_store_set_view(&s_store, JIANLU_VIEW_READY, NULL);
-        jianlu_dlink_bind(&s_store, dlink_ui_refresh_cb);
-        jianlu_dlink_set_pdone_cb(dlink_pdone_cb);
-        jianlu_dlink_set_app_cbs(dlink_time_cb, dlink_profile_cb, dlink_img_cb);
-        jianlu_dlink_set_pending(s_syncq.ids, s_syncq.count);
+        dlink_wire();
         jianlu_dlink_start();
         ESP_LOGI(TAG, "堆: 直连就绪后 %u", (unsigned)esp_get_free_heap_size());
         ui_refresh(JIANLU_ANIM_NONE);
@@ -1994,9 +2271,21 @@ void jianlu_app_start(void)
         break;
     }
 
-    // 串口截屏服务(只读,失败不影响应用)。配网态不启动:NimBLE 占 ~80K
-    // 后堆仅 ~13K,省下驱动的 1.9K 给 BLUFI 连接;配网成功重启后正常启用。
-    if (!s_prov_running && !s_dlink_mode) jianlu_shot_start();
+    // 串口截屏服务(只读,失败不影响应用)。配网态不启动:配网期堆余量
+    // 紧张(见 sdkconfig.defaults LV_MEM_SIZE 注释),省驱动的 1.9K 给 BLUFI。
+    if (!s_prov_running) jianlu_shot_start();
+
+    // 蓝牙切换验证失败回滚后的开机提示(展示一次即清)
+    if (!s_dlink_mode && !s_prov_running && s_nvs.cmode_fail != 0) {
+        ESP_LOGW(TAG, "上次蓝牙直连验证失败,已回滚: 原因 %d", s_nvs.cmode_fail);
+        if (bsp_lvgl_lock(500)) {
+            jianlu_ui_overlay_flash("蓝牙直连不可用,已切回",
+                                    jianlu_ui_accent(),
+                                    cmode_fail_reason(s_nvs.cmode_fail));
+            bsp_lvgl_unlock();
+        }
+        jianlu_nvs_save_cmode_fail(0);
+    }
 
     // 自动切换决策节拍(15s 周期):纯本地计时,累计观测量交事件循环决策;
     // Wi-Fi 态的中枢探测也由它按需投 JOB_HUBPING,业务层仍无自主网络动作。

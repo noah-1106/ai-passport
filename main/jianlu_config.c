@@ -3,6 +3,15 @@
 
 #include <stdbool.h>
 
+const char *jianlu_cmode_name(int cmode)
+{
+    switch (cmode) {
+    case JIANLU_CMODE_WIFI: return "Wi-Fi 中枢";
+    case JIANLU_CMODE_BLE:  return "蓝牙直连";
+    default:                return "自动";
+    }
+}
+
 static bool nonempty(const char *s)
 {
     return s != 0 && s[0] != '\0';
@@ -15,10 +24,12 @@ jianlu_wifi_src_t jianlu_config_pick_wifi(const char *nvs_ssid, const char *kcon
     return JIANLU_WIFI_NONE;
 }
 
-jianlu_boot_mode_t jianlu_config_boot_mode(bool dmode, bool reprov,
-                                           jianlu_wifi_src_t wifi_src)
+jianlu_boot_mode_t jianlu_config_boot_mode(jianlu_cmode_t cmode, bool dmode,
+                                           bool reprov, jianlu_wifi_src_t wifi_src)
 {
-    if (dmode) return JIANLU_BOOT_BLE;          // 直连优先于一切 Wi-Fi 逻辑
+    if (cmode == JIANLU_CMODE_BLE) return JIANLU_BOOT_BLE;   // 直连档优先于一切
+    if (cmode == JIANLU_CMODE_AUTO && dmode) return JIANLU_BOOT_BLE;  // 自动档上次切到了直连
+    // Wi-Fi 档忽略 dmode(可能残留自动切换的置位)
     if (reprov) return JIANLU_BOOT_PROV_FORCE;
     if (wifi_src != JIANLU_WIFI_NONE) return JIANLU_BOOT_WIFI;
     return JIANLU_BOOT_PROV_FRESH;

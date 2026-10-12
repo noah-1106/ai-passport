@@ -9,6 +9,7 @@
 // 自定义解码器必须包含它;升级 LVGL 时需复核。
 #include "image/lv_image_decoder_private.h"
 #include "jianlu_glyph.h"
+#include "jianlu_config.h"
 #include "jianlu_theme.h"
 #include "jianlu_json.h"
 #include "jianlu_layout.h"
@@ -435,7 +436,7 @@ static const char *status_text(const jianlu_store_t *store)
     case JIANLU_VIEW_READY:
     default:
         if (store->count == 0) {
-            if (store->dlink) return "直连模式 · 等待电脑连接";
+            if (store->dlink) return "蓝牙直连 · 等待电脑连接";
             return store->offline ? "离线中 · 清单将在联网后加载"
                                   : "全部完成啦";
         }
@@ -979,7 +980,7 @@ static lv_obj_t *s_set_rows[SETTINGS_ROWS];
 static lv_obj_t *s_set_vals[SETTINGS_ROWS];
 
 static const char *const SETTING_NAMES[SETTINGS_ROWS] = {
-    "屏幕亮度", "色彩主题", "屏幕常亮", "直连模式", "立即同步", "重新配网", "关于",
+    "屏幕亮度", "色彩主题", "屏幕常亮", "连接方式", "立即同步", "重新配网", "关于",
 };
 
 static void home_build(lv_obj_t *scr)
@@ -1218,7 +1219,7 @@ void jianlu_ui_qr_set(bool available, const jianlu_profile_t *prof)
 }
 
 void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
-                            int theme_id, bool dlink_on)
+                            int theme_id, int cmode)
 {
     for (int i = 0; i < SETTINGS_ROWS; i++) {
         lv_obj_set_style_border_width(s_set_rows[i], i == focus ? 2 : 0, 0);
@@ -1229,7 +1230,7 @@ void jianlu_ui_settings_set(int focus, int brightness_pct, bool keep_on,
     lv_label_set_text_fmt(s_set_vals[0], "%d%%", brightness_pct);
     lv_label_set_text(s_set_vals[1], jianlu_theme_name(theme_id));
     lv_label_set_text(s_set_vals[2], keep_on ? "开" : "关");
-    lv_label_set_text(s_set_vals[3], dlink_on ? "开" : "关");
+    lv_label_set_text(s_set_vals[3], jianlu_cmode_name(cmode));
 }
 
 // ---------------------------------------------------------------------------
