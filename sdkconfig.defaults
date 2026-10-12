@@ -27,9 +27,12 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 # 小诺简录:中文 UI 与网络动态中文内容,启用 LVGL 内置思源黑体 16 CJK 子集。
 # 覆盖率边界见 docs/development/engineering/lvgl-chinese-fonts.md。
 CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
-# LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
-CONFIG_LV_MEM_SIZE_KILOBYTES=10
+# LVGL 内置 malloc 池大小(字节)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
+# 实测直连主页峰值 32.2KB,定 48KB(留 ~40% 余量);若自建复杂界面出现文字变 "Text"
+# 占位/绘制卡死/看门狗,调大此值。池耗尽时 LVGL 分配静默失败,label 保持默认文本。
+# (旧 knob LV_MEM_SIZE_KILOBYTES 已被 LVGL 弃用且不生效,曾致 64KB 默认池常驻,
+#  把配网期堆余量压到 ~2KB,NimBLE 主机任务/广播数据分配静默失败。)
+CONFIG_LV_MEM_SIZE=49152
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
