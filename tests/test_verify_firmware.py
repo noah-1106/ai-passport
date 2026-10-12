@@ -344,5 +344,85 @@ class FirmwareCliTest(unittest.TestCase):
         self.run_verifier("invalid image offset")
 
 
+class CredentialLeakTest(unittest.TestCase):
+    """verify_no_embedded_credentials: 发布固件不得含本机凭据。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.build_dir = Path(self.tmp.name)
+        self.no_user_file = self.build_dir / "no-such-file"
+
+    def write_sdkconfig(self, *lines: str) -> None:
+        (self.build_dir / "sdkconfig").write_text("\n".join(lines) + "\n")
+
+    def test_accepts_empty_configs(self) -> None:
+        self.write_sdkconfig(
+            'CONFIG_XIAONUO_WIFI_SSID=""',
+            'CONFIG_XIAONUO_WIFI_PASSWORD=""',
+            'CONFIG_XIAONUO_HUB_URL=""',
+        )
+        VERIFY.verify_no_embedded_credentials(b"\xff" * 64, self.build_dir,
+                                              self.no_user_file)
+
+    def test_accepts_missing_sdkconfig(self) -> None:
+        VERIFY.verify_no_embedded_credentials(b"\xff" * 64, self.build_dir,
+                                              self.no_user_file)
+
+    def test_rejects_baked_hub_url(self) -> None:
+        self.write_sdkconfig('CONFIG_XIAONUO_HUB_URL="http://192.168.31.242:3000"')
+        with self.assertRaisesRegex(ValueError, "CONFIG_XIAONUO_HUB_URL"):
+            VERIFY.verify_no_embedded_credentials(b"\xff" * 64, self.build_dir,
+                                                  self.no_user_file)
+
+    def test_rejects_baked_wifi_password(self) -> None:
+        self.write_sdkconfig('CONFIG_XIAONUO_WIFI_PASSWORD="hunter2"')
+        with self.assertRaisesRegex(ValueError, "CONFIG_XIAONUO_WIFI_PASSWORD"):
+            VERIFY.verify_no_embedded_credentials(b"\xff" * 64, self.build_dir,
+                                                  self.no_user_file)
+
+    def test_rejects_user_defaults_value_in_binary(self) -> None:
+        user_defaults = self.build_dir / "sdkconfig.defaults.user"
+        user_defaults.write_text('CONFIG_XIAONUO_WIFI_PASSWORD="s3cret-pw"\n')
+        merged = b"\xff" * 32 + b"s3cret-pw\0" + b"\xff" * 32
+        with self.assertRaisesRegex(ValueError, "sdkconfig.defaults.user"):
+            VERIFY.verify_no_embedded_credentials(merged, self.build_dir,
+                                                  user_defaults)
+
+    def test_ignores_commented_and_empty_user_defaults(self) -> None:
+        user_defaults = self.build_dir / "sdkconfig.defaults.user"
+        user_defaults.write_text(
+            '# CONFIG_XIAONUO_WIFI_PASSWORD="s3cret-pw"\n'
+            'CONFIG_XIAONUO_WIFI_SSID=""\n'
+        )
+        merged = b"\xff" * 32 + b"s3cret-pw\0" + b"\xff" * 32
+        VERIFY.verify_no_embedded_credentials(merged, self.build_dir, user_defaults)
+
+
+class HeapBudgetTest(unittest.TestCase):
+    def write_map(self, heap_start: int | None) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        build_dir = Path(directory.name)
+        if heap_start is not None:
+            (build_dir / "FoloToy-AI-Passport.map").write_text(
+                f"                {heap_start:#x}                        _heap_start = ABSOLUTE (.)\n"
+            )
+        return build_dir
+
+    def test_accepts_baseline_heap_start(self) -> None:
+        VERIFY.verify_heap_budget(self.write_map(0x3FCC0B60))
+
+    def test_rejects_excessive_static_dram(self) -> None:
+        with self.assertRaisesRegex(ValueError, "static DRAM budget"):
+            VERIFY.verify_heap_budget(self.write_map(0x3FCC11B0))
+
+    def test_skips_missing_or_unparseable_map(self) -> None:
+        VERIFY.verify_heap_budget(self.write_map(None))
+        build_dir = self.write_map(0)
+        (build_dir / "FoloToy-AI-Passport.map").write_text("no marker here\n")
+        VERIFY.verify_heap_budget(build_dir)
+
+
 if __name__ == "__main__":
     unittest.main()

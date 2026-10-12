@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import struct
 import sys
@@ -21,6 +22,33 @@ FLASH_SIZE = 8 * 1024 * 1024
 PARTITION_TABLE_SIZE = 0xC00
 PARTITION_TABLE_SECTOR_SIZE = 0x1000
 ENTRY = struct.Struct("<HBBII16sI")
+
+# 静态内存预算:配网期 Wi-Fi 与 NimBLE 共存,堆余量以 KB 计。
+# 实测 438dd72 基线 _heap_start=0x3fcc0b60 正常,+1424B 后 NimBLE 主机任务
+# 创建被静默吞掉(esp_nimble_enable 不检查 xTaskCreate 返回值),BLUFI 不广播。
+# 上限定在基线 +2.5KB,留出正常增长空间又远低于危险区。
+HEAP_START_LIMIT = 0x3FCC0E00
+
+
+def verify_heap_budget(build_dir: Path) -> None:
+    """Fail when static DRAM usage leaves too little heap for provisioning."""
+    map_path = build_dir / "FoloToy-AI-Passport.map"
+    if not map_path.is_file():
+        return
+    match = re.search(
+        r"^\s*(0x[0-9a-fA-F]+)\s+_heap_start = ABSOLUTE",
+        map_path.read_text(encoding="utf-8", errors="replace"),
+        re.MULTILINE,
+    )
+    if not match:
+        return
+    heap_start = int(match.group(1), 16)
+    if heap_start > HEAP_START_LIMIT:
+        raise ValueError(
+            f"static DRAM budget exceeded: _heap_start={heap_start:#x} "
+            f"> {HEAP_START_LIMIT:#x} (provisioning heap margin)"
+        )
+    print(f"Heap budget: PASS (_heap_start={heap_start:#x})")
 
 
 @dataclass(frozen=True)
@@ -186,6 +214,50 @@ def verify_extra_image_partitions(
             raise ValueError(f"image {name} must fit entirely within one partition")
 
 
+# 发布固件必须留空的凭据项(sdkconfig.defaults.user 仅供本机开发,
+# 编进发布固件 = 中枢地址被钉死 + Wi-Fi 密码明文外泄)
+SENSITIVE_CONFIGS = (
+    "CONFIG_XIAONUO_WIFI_SSID",
+    "CONFIG_XIAONUO_WIFI_PASSWORD",
+    "CONFIG_XIAONUO_HUB_URL",
+)
+
+
+def verify_no_embedded_credentials(
+    merged: bytes, build_dir: Path, user_defaults_path: Path | None = None
+) -> None:
+    """Fail the release build if personal credentials leaked into the binary."""
+    sdkconfig_path = build_dir / "sdkconfig"
+    if sdkconfig_path.is_file():
+        for line in sdkconfig_path.read_text(encoding="utf-8").splitlines():
+            for key in SENSITIVE_CONFIGS:
+                if line.startswith(f"{key}="):
+                    value = line.split("=", 1)[1].strip().strip('"')
+                    if value:
+                        raise ValueError(
+                            f"{key} is set ({value!r}); release firmware must keep "
+                            "it empty (check SDKCONFIG_DEFAULTS excludes "
+                            "sdkconfig.defaults.user)"
+                        )
+    # 双保险:本机凭据文件的值直接对二进制做子串匹配
+    if user_defaults_path is None:
+        user_defaults_path = (
+            Path(__file__).resolve().parent.parent / "sdkconfig.defaults.user"
+        )
+    if user_defaults_path.is_file():
+        for line in user_defaults_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            value = line.split("=", 1)[1].strip().strip('"')
+            if value and value.encode() in merged:
+                raise ValueError(
+                    f"merged firmware contains a value from sdkconfig.defaults.user "
+                    f"({line.split('=', 1)[0]}); rebuild without the user defaults file"
+                )
+    print("Credential leak check: PASS")
+
+
 def main() -> int:
     build_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "build").resolve()
     merged_path = build_dir / "FoloToy-AI-Passport-full.bin"
@@ -216,6 +288,8 @@ def main() -> int:
             image_offsets["FoloToy-AI-Passport.bin"],
         )
         verify_extra_image_partitions(image_offsets, image_sizes, partitions)
+        verify_no_embedded_credentials(merged, build_dir)
+        verify_heap_budget(build_dir)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
