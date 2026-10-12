@@ -50,13 +50,22 @@ int main(void) {
     assert(!jianlu_ps_key(&ps, false));
     assert(ps.idle_s == 0);
 
-    // 忙(录音/上传)不累计空闲
+    // 忙(录音/配网/直连):熄屏照常(60s),只挡 light sleep(600s 不睡)
     jianlu_ps_set_busy(&ps, true);
-    for (int i = 0; i < JIANLU_PS_LIGHT_SLEEP_S + 10; i++) {
+    for (int i = 0; i < JIANLU_PS_SCREEN_OFF_S - 1; i++) {
         assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_NONE);
     }
-    assert(ps.screen_on && ps.idle_s == 0);
+    assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_SCREEN_OFF);   // 忙时仍熄屏
+    assert(!ps.screen_on);
+    for (int i = JIANLU_PS_SCREEN_OFF_S + 1; i <= JIANLU_PS_LIGHT_SLEEP_S + 10; i++) {
+        assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_NONE);     // 忙时不进休眠
+    }
+    // 忙期间错过 600s 整点;忙一解除,下一拍补报休眠(且只补一次)
     jianlu_ps_set_busy(&ps, false);
+    assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_LIGHT_SLEEP);
+    assert(jianlu_ps_tick(&ps) == JIANLU_PS_ACT_NONE);
+    jianlu_ps_woke(&ps);
+    assert(ps.screen_on && ps.idle_s == 0);
 
     // 600 秒进 light sleep(只在跨越时报一次)
     for (int i = 0; i < JIANLU_PS_SCREEN_OFF_S; i++) jianlu_ps_tick(&ps);

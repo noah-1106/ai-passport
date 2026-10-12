@@ -6,24 +6,31 @@ void jianlu_ps_init(jianlu_ps_t *ps)
     ps->idle_s = 0;
     ps->screen_on = true;
     ps->busy = false;
+    ps->keep_on = false;
+    ps->sleep_noted = false;
     ps->eat_gesture = false;
 }
 
 uint8_t jianlu_ps_tick(jianlu_ps_t *ps)
 {
-    if (ps->busy || ps->keep_on) {
+    if (ps->keep_on) {
         ps->idle_s = 0;
         return JIANLU_PS_ACT_NONE;
     }
+    // busy(录音/配网/直连)只挡 light sleep——熄屏只是关背光,不影响 BLE/网络
     ps->idle_s++;
     if (ps->screen_on && ps->idle_s >= JIANLU_PS_SCREEN_OFF_S) {
         ps->screen_on = false;
-        if (ps->idle_s >= JIANLU_PS_LIGHT_SLEEP_S) {
+        if (!ps->busy && ps->idle_s >= JIANLU_PS_LIGHT_SLEEP_S) {
+            ps->sleep_noted = true;
             return JIANLU_PS_ACT_LIGHT_SLEEP;   // 已超过更深阈值,直接睡
         }
         return JIANLU_PS_ACT_SCREEN_OFF;
     }
-    if (!ps->screen_on && ps->idle_s == JIANLU_PS_LIGHT_SLEEP_S) {
+    // 边沿报一次;busy 期间错过的睡眠时机在忙解除后下一拍补报
+    if (!ps->screen_on && !ps->busy && !ps->sleep_noted &&
+        ps->idle_s >= JIANLU_PS_LIGHT_SLEEP_S) {
+        ps->sleep_noted = true;
         return JIANLU_PS_ACT_LIGHT_SLEEP;
     }
     return JIANLU_PS_ACT_NONE;
@@ -32,6 +39,7 @@ uint8_t jianlu_ps_tick(jianlu_ps_t *ps)
 bool jianlu_ps_key(jianlu_ps_t *ps, bool gesture_end)
 {
     ps->idle_s = 0;
+    ps->sleep_noted = false;   // 有活动,开启新一轮休眠计时
     if (!ps->screen_on) {
         // 灭屏首事件:唤醒并吞掉,且吞到本手势结束
         ps->screen_on = true;
@@ -50,19 +58,20 @@ void jianlu_ps_set_keep_on(jianlu_ps_t *ps, bool keep_on)
     ps->keep_on = keep_on;
     if (keep_on) {
         ps->idle_s = 0;
+        ps->sleep_noted = false;
         ps->screen_on = true;   // 开常亮立即亮屏
     }
 }
 
 void jianlu_ps_set_busy(jianlu_ps_t *ps, bool busy)
 {
-    ps->busy = busy;
-    if (busy) ps->idle_s = 0;
+    ps->busy = busy;   // 不清 idle_s:busy 只挡休眠,不该拦住熄屏计时
 }
 
 void jianlu_ps_woke(jianlu_ps_t *ps)
 {
     ps->idle_s = 0;
     ps->screen_on = true;
+    ps->sleep_noted = false;
     ps->eat_gesture = true;   // 睡中按下唤醒键的手势,事件会随后到来,吞掉
 }

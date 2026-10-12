@@ -1,7 +1,7 @@
 // main/jianlu_powersave.h —— 省电策略状态(纯 C,host 可测)。
 //
-// 规则:忙(录音/上传)时不累计空闲、不熄屏;空闲 60s 熄屏(背光,Wi-Fi 保持),
-// 空闲 600s 建议进 light sleep。任意键复位空闲并点亮屏幕。
+// 规则:空闲 60s 熄屏(背光,Wi-Fi/BLE 保持),空闲 600s 建议进 light sleep;
+// 忙(录音/配网/直连)时只禁止 light sleep,不挡熄屏。任意键复位空闲并点亮屏幕。
 #pragma once
 
 #include <stdbool.h>
@@ -19,6 +19,7 @@ typedef struct {
     bool screen_on;
     bool busy;
     bool keep_on;       // 屏幕常亮:不熄屏、不进 light sleep
+    bool sleep_noted;   // 本轮空闲已报过 light sleep(边沿去重;busy 错过的时机补报)
     bool eat_gesture;   // 正在吞没唤醒手势的后续事件(首事件已吞)
 } jianlu_ps_t;
 
@@ -34,7 +35,7 @@ uint8_t jianlu_ps_tick(jianlu_ps_t *ps);
 // 未吞没的普通按键同时复位空闲计时。
 bool jianlu_ps_key(jianlu_ps_t *ps, bool gesture_end);
 
-// 忙状态切换(录音/上传中禁止休眠)。
+// 忙状态切换(录音/配网/直连中禁止 light sleep;熄屏不受影响)。
 void jianlu_ps_set_busy(jianlu_ps_t *ps, bool busy);
 
 // 屏幕常亮切换:开 = 不熄屏不进 light sleep(立即亮屏);关 = 恢复计时。
