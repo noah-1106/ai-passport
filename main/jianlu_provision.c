@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -34,6 +35,7 @@ static bool s_profile_initialized;
 static bool s_ble_connected;
 static bool s_wifi_connected;        // 应用通过 report_wifi 告知
 static bool s_wifi_ready;            // Wi-Fi 协议栈已初始化(本应用配网与联网分离,恒 false)
+static esp_timer_handle_t s_sync_watchdog;
 
 void jianlu_provision_set_wifi_ready(bool ready)
 {
@@ -44,6 +46,18 @@ static void post(jianlu_prov_ev_t ev, const char *ssid, const char *pass,
                  const char *data)
 {
     if (s_cb) s_cb(ev, ssid, pass, data, s_cb_user);
+}
+
+// 同步看门狗:esp_nimble_enable 内部 xTaskCreate 失败被吞(恒返回 ESP_OK),
+// 堆不足时主机任务根本没跑 → 永不广播且零日志。3s 未同步即报错浮出水面。
+static void sync_watchdog_cb(void *arg)
+{
+    (void)arg;
+    if (!ble_hs_synced()) {
+        ESP_LOGE(TAG, "NimBLE 主机 3s 未同步(疑堆不足,空闲 %u)",
+                 (unsigned)esp_get_free_heap_size());
+        post(JIANLU_PROV_FAILED, NULL, NULL, NULL);
+    }
 }
 
 void jianlu_provision_report_wifi(bool connected)
@@ -69,6 +83,7 @@ static void blufi_reset(int reason)
 
 static void blufi_sync(void)
 {
+    if (s_sync_watchdog) esp_timer_stop(s_sync_watchdog);
     int rc = esp_blufi_profile_init();
     if (rc == 0) {
         s_profile_initialized = true;
@@ -209,7 +224,16 @@ esp_err_t jianlu_provision_start(jianlu_prov_cb_t cb, void *user)
     esp_blufi_btc_init();
     s_btc_initialized = true;
     err = esp_nimble_enable(host_task);
-    if (err == ESP_OK) s_host_running = true;
+    if (err == ESP_OK) {
+        s_host_running = true;
+        ESP_LOGI(TAG, "BLUFI 已启动,空闲堆 %u", (unsigned)esp_get_free_heap_size());
+        const esp_timer_create_args_t wd = {
+            .callback = sync_watchdog_cb, .name = "prov_sync_wd",
+        };
+        if (esp_timer_create(&wd, &s_sync_watchdog) == ESP_OK) {
+            esp_timer_start_once(s_sync_watchdog, 3000000);
+        }
+    }
     return err;
 }
 
@@ -220,6 +244,11 @@ esp_err_t jianlu_provision_stop(void)
     s_cb_user = NULL;
     s_ble_connected = false;
     jianlu_blufi_security_deinit();
+    if (s_sync_watchdog) {
+        esp_timer_stop(s_sync_watchdog);
+        esp_timer_delete(s_sync_watchdog);
+        s_sync_watchdog = NULL;
+    }
 
     if (s_profile_initialized) esp_blufi_adv_stop();
     if (s_gatt_initialized) {

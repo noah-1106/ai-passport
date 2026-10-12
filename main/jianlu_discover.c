@@ -71,19 +71,37 @@ static void mdns_send_query(int fd, const char *name, uint16_t qtype)
              name, qtype, r, (unsigned)ntohs(local.sin_port), errno);
 }
 
-// 在截止时间前收包并累积解析;每收到一个含新信息的包记日志。
-static void mdns_collect(int fd, jianlu_dns_t *res, const char *a_filter,
-                         int64_t deadline_ms)
+// 在截止时间前收包并累积解析;每收到一个含新信息的包记日志。返回累计收获掩码。
+static int mdns_collect(int fd, jianlu_dns_t *res, const char *a_filter,
+                        int64_t deadline_ms)
 {
+    int got = 0;
     size_t scratch_len = 0;
     uint8_t *pkt = jianlu_net_scratch(&scratch_len);   // 网络任务共享刮擦区
     size_t cap = scratch_len < 900 ? scratch_len : 900;
     while (now_ms() < deadline_ms) {
         ssize_t n = recv(fd, pkt, cap, 0);
         if (n <= 0) continue;
-        int got = jianlu_dns_parse(pkt, (size_t)n, res, a_filter);
+        got |= jianlu_dns_parse(pkt, (size_t)n, res, a_filter);
         ESP_LOGD(TAG, "收到 %d 字节 mDNS 包,收获掩码 0x%x", (int)n, got);
     }
+    return got;
+}
+
+// 阶段内每 700ms 重发查询直到拿到目标记录或到截止(RFC 6762 推荐重传;
+// 实测小米路由器偶发丢组播查询/应答,单发一遍成功率只有 ~50%)。
+static int mdns_query_until(int fd, jianlu_dns_t *res, const char *a_filter,
+                            const char *name, uint16_t qtype, int want_mask,
+                            int64_t deadline_ms)
+{
+    int got = 0;
+    while (now_ms() < deadline_ms && (got & want_mask) != want_mask) {
+        mdns_send_query(fd, name, qtype);
+        int64_t until = now_ms() + 700;
+        if (until > deadline_ms) until = deadline_ms;
+        got |= mdns_collect(fd, res, a_filter, until);
+    }
+    return got;
 }
 
 esp_err_t jianlu_discover_hub(char *url, size_t url_len, int timeout_ms)
@@ -101,23 +119,18 @@ esp_err_t jianlu_discover_hub(char *url, size_t url_len, int timeout_ms)
     int64_t srv_deadline = t0 + timeout_ms * 3 / 4;
     int64_t a_deadline = t0 + timeout_ms;
 
-    // 阶段 1:PTR(发两次防丢)
-    mdns_send_query(fd, "_xiaonuo._tcp.local", 12);
-    mdns_collect(fd, &res, NULL, t0 + 250);
-    if (res.ptr_target[0] == '\0') {
-        mdns_send_query(fd, "_xiaonuo._tcp.local", 12);
-    }
-    mdns_collect(fd, &res, NULL, ptr_deadline);
-
+    // 阶段 1:PTR(阶段内自动重传)
+    mdns_query_until(fd, &res, NULL, "_xiaonuo._tcp.local", 12,
+                     JIANLU_DNS_GOT_PTR, ptr_deadline);
     // 阶段 2:SRV(PTR 应答可能已附带,如 zeroconf;Mac mDNSResponder 只回 PTR)
     if (res.ptr_target[0] != '\0' && res.srv_port == 0) {
-        mdns_send_query(fd, res.ptr_target, 33);
-        mdns_collect(fd, &res, NULL, srv_deadline);
+        mdns_query_until(fd, &res, NULL, res.ptr_target, 33,
+                         JIANLU_DNS_GOT_SRV, srv_deadline);
     }
     // 阶段 3:A(若还没有);用 SRV 目标名过滤,避免错收同名域的其他 A
     if (res.srv_port != 0 && res.a_ipv4 == 0) {
-        mdns_send_query(fd, res.srv_target, 1);
-        mdns_collect(fd, &res, res.srv_target, a_deadline);
+        mdns_query_until(fd, &res, res.srv_target, res.srv_target, 1,
+                         JIANLU_DNS_GOT_A, a_deadline);
     }
     close(fd);
 

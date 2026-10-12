@@ -167,6 +167,11 @@ esp_err_t jianlu_hub_complete(const char *id)
         ESP_LOGW(TAG, "完成上报失败 id=%s: %s", id, esp_err_to_name(err));
         return err;
     }
+    if (status == 404) {
+        // 中枢已删掉该条:勾选目标不存在,视同完成,出队不再重试
+        ESP_LOGI(TAG, "完成上报 id=%s: 中枢已无此条(404),视同完成", id);
+        return ESP_OK;
+    }
     if (status < 200 || status >= 300) {
         ESP_LOGW(TAG, "完成上报失败 id=%s: HTTP %d", id, status);
         return ESP_ERR_INVALID_RESPONSE;
